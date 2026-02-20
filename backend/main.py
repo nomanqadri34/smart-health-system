@@ -9,6 +9,8 @@ from fastapi_mail import FastMail, MessageSchema, ConnectionConfig, MessageType
 from icalendar import Calendar, Event, vText
 from apscheduler.schedulers.background import BackgroundScheduler
 import os
+import io
+from starlette.datastructures import UploadFile
 
 from ml_logic import predict_appointment
 
@@ -160,6 +162,13 @@ async def send_reminder_email(req: ScheduleRequest, reminder_type: str):
         print(f"Failed to send {reminder_type} reminder: {e}")
 
 
+async def send_initial_email(message: MessageSchema):
+    """Wrapper to catch SMTP errors when using dummy credentials for local dev."""
+    try:
+        await fm.send_message(message)
+    except Exception as e:
+        print(f"Warning: Could not send email (check SMTP credentials): {e}")
+
 @app.post("/api/schedule-appointment")
 async def schedule_appointment(req: ScheduleRequest, background_tasks: BackgroundTasks):
     """
@@ -167,7 +176,12 @@ async def schedule_appointment(req: ScheduleRequest, background_tasks: Backgroun
     2. Schedules 24h and 1h reminders
     """
     # 1. Immediate confirmation with ICS
-    ics_file = create_ics(req)
+    ics_file_bytes = create_ics(req)
+    
+    # Wrap bytes in an UploadFile so fastapi-mail treats it as a file
+    ics_io = io.BytesIO(ics_file_bytes)
+    ics_io.seek(0)
+    upload_file = UploadFile(filename="appointment.ics", file=ics_io)
     
     body = f"""
     Hello,
@@ -188,17 +202,12 @@ async def schedule_appointment(req: ScheduleRequest, background_tasks: Backgroun
         recipients=[req.patient_email, req.doctor_email],
         body=body,
         subtype=MessageType.plain,
-        attachments=[{
-            "file": ics_file,
-            "filename": "appointment.ics",
-            "mime_type": "text/calendar",
-            "headers": {"Content-Disposition": 'attachment; filename="appointment.ics"'}
-        }]
+        attachments=[upload_file]
     )
     
     try:
         # We send the initial email immediately (or via background task)
-        background_tasks.add_task(fm.send_message, message)
+        background_tasks.add_task(send_initial_email, message)
         
         # 2. Schedule Reminders
         appt_time = datetime.strptime(f"{req.date} {req.time}", "%Y-%m-%d %H:%M")
@@ -221,7 +230,8 @@ async def schedule_appointment(req: ScheduleRequest, background_tasks: Backgroun
                 'date', 
                 run_date=time_24h, 
                 args=[send_reminder_email(req, "24 Hours")],
-                id=f"{req.appointment_id}_24h"
+                id=f"{req.appointment_id}_24h",
+                replace_existing=True
             )
             
         if time_1h > now:
@@ -230,7 +240,8 @@ async def schedule_appointment(req: ScheduleRequest, background_tasks: Backgroun
                 'date', 
                 run_date=time_1h, 
                 args=[send_reminder_email(req, "1 Hour")],
-                id=f"{req.appointment_id}_1h"
+                id=f"{req.appointment_id}_1h",
+                replace_existing=True
             )
             
         return {"status": "Scheduled successfully", "appointment_id": req.appointment_id}
