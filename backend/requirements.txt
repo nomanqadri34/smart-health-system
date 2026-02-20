@@ -1,0 +1,9 @@
+fastapi
+uvicorn
+scikit-learn
+pandas
+numpy
+requests
+fastapi-mail
+icalendar
+apscheduler
