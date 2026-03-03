@@ -1,6 +1,6 @@
 """
 Unit tests for error handlers.
-Tests for issue #2: Improve error handling and logging
+Tests for issue #2: Enhanced error handling and logging system
 """
 import pytest
 from fastapi import Request
@@ -10,7 +10,10 @@ from error_handlers import (
     ValidationError,
     DatabaseError,
     AuthenticationError,
+    AuthorizationError,
     NotFoundError,
+    ConflictError,
+    RateLimitError,
     create_error_response,
     api_error_handler
 )
@@ -25,6 +28,7 @@ class TestAPIErrors:
         assert error.message == "Test error"
         assert error.status_code == 500
         assert error.details == {}
+        assert error.timestamp is not None
     
     def test_api_error_with_details(self):
         """Test that APIError can include additional details."""
@@ -32,29 +36,59 @@ class TestAPIErrors:
         error = APIError("Validation failed", status_code=400, details=details)
         assert error.details == details
     
+    def test_api_error_with_code(self):
+        """Test that APIError can include error code."""
+        error = APIError("Test", status_code=400, error_code="TEST_ERROR")
+        assert error.error_code == "TEST_ERROR"
+    
     def test_validation_error(self):
         """Test that ValidationError has correct status code."""
         error = ValidationError("Invalid input")
         assert error.status_code == 400
         assert "Invalid input" in error.message
+        assert error.error_code == "VALIDATION_ERROR"
     
     def test_database_error(self):
         """Test that DatabaseError has correct status code."""
         error = DatabaseError("Connection failed")
         assert error.status_code == 500
         assert "Connection failed" in error.message
+        assert error.error_code == "DATABASE_ERROR"
     
     def test_authentication_error(self):
         """Test that AuthenticationError has correct status code."""
         error = AuthenticationError("Invalid credentials")
         assert error.status_code == 401
         assert "Invalid credentials" in error.message
+        assert error.error_code == "AUTH_ERROR"
+    
+    def test_authorization_error(self):
+        """Test that AuthorizationError has correct status code."""
+        error = AuthorizationError("Access denied")
+        assert error.status_code == 403
+        assert "Access denied" in error.message
+        assert error.error_code == "AUTHORIZATION_ERROR"
     
     def test_not_found_error(self):
         """Test that NotFoundError has correct status code."""
         error = NotFoundError("Resource not found")
         assert error.status_code == 404
         assert "Resource not found" in error.message
+        assert error.error_code == "NOT_FOUND"
+    
+    def test_conflict_error(self):
+        """Test that ConflictError has correct status code."""
+        error = ConflictError("Resource already exists")
+        assert error.status_code == 409
+        assert "Resource already exists" in error.message
+        assert error.error_code == "CONFLICT"
+    
+    def test_rate_limit_error(self):
+        """Test that RateLimitError has correct status code."""
+        error = RateLimitError()
+        assert error.status_code == 429
+        assert "Rate limit exceeded" in error.message
+        assert error.error_code == "RATE_LIMIT_EXCEEDED"
 
 
 class TestErrorResponse:
@@ -65,6 +99,7 @@ class TestErrorResponse:
         response = create_error_response(400, "Bad request")
         assert response["error"]["message"] == "Bad request"
         assert response["error"]["status_code"] == 400
+        assert "timestamp" in response["error"]
     
     def test_create_error_response_with_details(self):
         """Test creating error response with additional details."""
@@ -81,12 +116,22 @@ class TestErrorResponse:
         )
         assert response["error"]["code"] == "DB_CONNECTION_FAILED"
     
+    def test_create_error_response_with_request_id(self):
+        """Test creating error response with request ID."""
+        response = create_error_response(
+            500,
+            "Internal error",
+            request_id="req-123"
+        )
+        assert response["error"]["request_id"] == "req-123"
+    
     def test_error_response_structure(self):
         """Test that error response has correct structure."""
         response = create_error_response(404, "Not found")
         assert "error" in response
         assert "message" in response["error"]
         assert "status_code" in response["error"]
+        assert "timestamp" in response["error"]
 
 
 class TestErrorHandlerIntegration:
@@ -99,6 +144,7 @@ class TestErrorHandlerIntegration:
         class MockRequest:
             url = type('obj', (object,), {'path': '/test'})()
             method = "GET"
+            headers = {"X-Request-ID": "test-123"}
         
         request = MockRequest()
         error = ValidationError("Invalid input", details={"field": "email"})
@@ -121,9 +167,24 @@ class TestErrorHandlerIntegration:
         error = AuthenticationError("Test")
         assert isinstance(error, APIError)
     
+    def test_authorization_error_inheritance(self):
+        """Test that AuthorizationError inherits from APIError."""
+        error = AuthorizationError("Test")
+        assert isinstance(error, APIError)
+    
     def test_not_found_error_inheritance(self):
         """Test that NotFoundError inherits from APIError."""
         error = NotFoundError("Test")
+        assert isinstance(error, APIError)
+    
+    def test_conflict_error_inheritance(self):
+        """Test that ConflictError inherits from APIError."""
+        error = ConflictError("Test")
+        assert isinstance(error, APIError)
+    
+    def test_rate_limit_error_inheritance(self):
+        """Test that RateLimitError inherits from APIError."""
+        error = RateLimitError()
         assert isinstance(error, APIError)
 
 
@@ -148,3 +209,53 @@ class TestErrorMessages:
         error = APIError("Test")
         assert error.details == {}
         assert isinstance(error.details, dict)
+    
+    def test_error_code_accessible(self):
+        """Test that error code is accessible."""
+        error = APIError("Test", error_code="TEST_CODE")
+        assert error.error_code == "TEST_CODE"
+    
+    def test_timestamp_format(self):
+        """Test that timestamp is in ISO format."""
+        error = APIError("Test")
+        assert "T" in error.timestamp  # ISO format contains 'T'
+        assert isinstance(error.timestamp, str)
+
+
+class TestErrorCodes:
+    """Test cases for error codes."""
+    
+    def test_validation_error_code(self):
+        """Test ValidationError has correct error code."""
+        error = ValidationError("Test")
+        assert error.error_code == "VALIDATION_ERROR"
+    
+    def test_database_error_code(self):
+        """Test DatabaseError has correct error code."""
+        error = DatabaseError("Test")
+        assert error.error_code == "DATABASE_ERROR"
+    
+    def test_auth_error_code(self):
+        """Test AuthenticationError has correct error code."""
+        error = AuthenticationError("Test")
+        assert error.error_code == "AUTH_ERROR"
+    
+    def test_authorization_error_code(self):
+        """Test AuthorizationError has correct error code."""
+        error = AuthorizationError("Test")
+        assert error.error_code == "AUTHORIZATION_ERROR"
+    
+    def test_not_found_error_code(self):
+        """Test NotFoundError has correct error code."""
+        error = NotFoundError("Test")
+        assert error.error_code == "NOT_FOUND"
+    
+    def test_conflict_error_code(self):
+        """Test ConflictError has correct error code."""
+        error = ConflictError("Test")
+        assert error.error_code == "CONFLICT"
+    
+    def test_rate_limit_error_code(self):
+        """Test RateLimitError has correct error code."""
+        error = RateLimitError()
+        assert error.error_code == "RATE_LIMIT_EXCEEDED"
