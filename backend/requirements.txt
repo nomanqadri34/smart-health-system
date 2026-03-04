@@ -7,3 +7,6 @@ requests
 fastapi-mail
 icalendar
 apscheduler
+
+# Notification dependencies
+python-multipart>=0.0.6
