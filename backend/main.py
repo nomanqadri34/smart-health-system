@@ -985,3 +985,14 @@ from file_validator_v2 import FileValidator
 file_uploader_v2_service = FileUploader(config={"enabled": True})
 file_validator_v2_service = FileValidator(config={"enabled": True})
 
+
+# ============================================
+# Search v2 System Integration
+# ============================================
+from search_indexer_v2 import SearchIndexer
+from search_query_v2 import SearchQuery
+
+# Initialize Search v2 services
+search_indexer_v2_service = SearchIndexer(config={"enabled": True})
+search_query_v2_service = SearchQuery(config={"enabled": True})
+
