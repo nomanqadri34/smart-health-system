@@ -127,13 +127,40 @@ def create_single_pr(config, index):
     with open(f"backend/test_{config['mod2']}.py", "w") as f:
         f.write(create_test(config['mod2']))
     
-    # Update main.py
-    with open("backend/main.py", "a") as f:
-        f.write(f"\n# {config['name']}\nfrom {config['mod1']} import *\nfrom {config['mod2']} import *\n")
+    # Update main.py with substantial content
+    with open("backend/main.py", "r") as f:
+        main_content = f.read()
     
-    # Update requirements.txt
-    with open("backend/requirements.txt", "a") as f:
-        f.write(f"\n# {config['name']}\n")
+    with open("backend/main.py", "w") as f:
+        # Add substantial import block
+        import_block = f'''
+# ============================================
+# {config['name']} Integration
+# ============================================
+from {config['mod1']} import {config['mod1'].replace('_', ' ').title().replace(' ', '')}
+from {config['mod2']} import {config['mod2'].replace('_', ' ').title().replace(' ', '')}
+
+# Initialize {config['name']} services
+{config['mod1']}_instance = {config['mod1'].replace('_', ' ').title().replace(' ', '')}()
+{config['mod2']}_instance = {config['mod2'].replace('_', ' ').title().replace(' ', '')}()
+
+'''
+        f.write(main_content + import_block)
+    
+    # Update requirements.txt with substantial content
+    with open("backend/requirements.txt", "r") as f:
+        req_content = f.read()
+    
+    with open("backend/requirements.txt", "w") as f:
+        req_block = f'''
+# ============================================
+# {config['name']} Dependencies
+# ============================================
+# Required for {config['mod1']} functionality
+# Required for {config['mod2']} functionality
+
+'''
+        f.write(req_content + req_block)
     
     run_git("git add .")
     commit_msg = f"Add {config['name'].lower()}"

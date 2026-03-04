@@ -963,3 +963,14 @@ from search_query import *
 # Backup System
 from backup_manager import *
 from backup_scheduler import *
+
+# ============================================
+# API Auth v2 System Integration
+# ============================================
+from auth_handler_v2 import AuthHandler
+from token_manager_v2 import TokenManager
+
+# Initialize API Auth v2 services
+auth_handler_v2_service = AuthHandler(config={"enabled": True})
+token_manager_v2_service = TokenManager(config={"enabled": True})
+
