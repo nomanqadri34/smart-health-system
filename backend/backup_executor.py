@@ -1,12 +1,12 @@
 """
-Backup Scheduler - Production module
+Backup Executor - Production module
 """
 from typing import Dict, List, Optional, Any
 from datetime import datetime
 import json
 
-class BackupScheduler:
-    """Production BackupScheduler with full features"""
+class BackupExecutor:
+    """Production BackupExecutor with full features"""
     
     def __init__(self, config: Optional[Dict] = None):
         self.config = config or {}
