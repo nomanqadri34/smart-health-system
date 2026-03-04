@@ -947,3 +947,7 @@ from data_sanitizer import *
 # Session Management
 from session_manager import *
 from session_store import *
+
+# API Authentication
+from auth_handler import *
+from token_manager import *
