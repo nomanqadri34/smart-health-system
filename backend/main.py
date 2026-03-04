@@ -939,3 +939,7 @@ from rate_limiter import RateLimiter
 # Initialize services
 content_classifier = ContentClassifier()
 rate_limiter = RateLimiter(max_requests=100, window_seconds=60)
+
+# Import Data Validation System
+from data_validator import *
+from data_sanitizer import *
