@@ -974,3 +974,14 @@ from token_manager_v2 import TokenManager
 auth_handler_v2_service = AuthHandler(config={"enabled": True})
 token_manager_v2_service = TokenManager(config={"enabled": True})
 
+
+# ============================================
+# File Upload v2 System Integration
+# ============================================
+from file_uploader_v2 import FileUploader
+from file_validator_v2 import FileValidator
+
+# Initialize File Upload v2 services
+file_uploader_v2_service = FileUploader(config={"enabled": True})
+file_validator_v2_service = FileValidator(config={"enabled": True})
+

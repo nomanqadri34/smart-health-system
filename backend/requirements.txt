@@ -36,3 +36,11 @@ python-dateutil>=2.8.2
 # Core dependencies for token_manager_v2
 # Enhanced features and utilities
 
+
+# ============================================
+# File Upload v2 System Dependencies
+# ============================================
+# Core dependencies for file_uploader_v2
+# Core dependencies for file_validator_v2
+# Enhanced features and utilities
+
