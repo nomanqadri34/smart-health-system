@@ -43,3 +43,12 @@ class UserData(BaseModel):
     id: int
     email: str
     full_name: str
+
+
+# Analytics and reporting imports
+from analytics_service import AnalyticsService
+from report_generator import ReportGenerator
+
+# Initialize analytics
+analytics = AnalyticsService()
+reports = ReportGenerator()
