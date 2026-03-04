@@ -931,3 +931,11 @@ from cache_service import CacheService
 # Initialize services
 notification_service = NotificationService()
 cache_service = CacheService()
+
+# Import content classifier and rate limiter
+from content_classifier import ContentClassifier
+from rate_limiter import RateLimiter
+
+# Initialize services
+content_classifier = ContentClassifier()
+rate_limiter = RateLimiter(max_requests=100, window_seconds=60)
