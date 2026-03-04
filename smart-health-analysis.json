@@ -1,0 +1,42 @@
+{
+  "repo_name": "smart-health-system",
+  "repo_full_name": "nomanqadri34/smart-health-system",
+  "overall_score": 7.199999999999999,
+  "recommendation": "\u274c POOR",
+  "repo_metrics": {
+    "repo_name": "nomanqadri34_smart-health-system",
+    "total_files": 21,
+    "test_files": 0,
+    "test_file_ratio": 0.0,
+    "source_files": 6,
+    "total_loc": 1077,
+    "source_loc": 1077,
+    "test_loc": 0,
+    "languages": {
+      "Python": 6
+    },
+    "primary_language": "Python",
+    "has_ci_cd": false,
+    "ci_files": [],
+    "test_frameworks": [],
+    "has_test_runner": false,
+    "total_commits": 6,
+    "recent_commits_12mo": 6,
+    "commits_referencing_issues": 1,
+    "test_coverage_percentage": null,
+    "swebench_readiness_score": 12.0,
+    "recommendation": "\u274c POOR - Not recommended for SWE-Bench+ samples",
+    "strengths": [],
+    "weaknesses": [],
+    "commit_spread_days": 10.7,
+    "median_commit_interval_hours": 0.12
+  },
+  "pr_analysis": {
+    "total_prs": 0,
+    "accepted": 0,
+    "rejected": 0,
+    "acceptance_rate": 0.0,
+    "rejection_breakdown": {},
+    "accepted_prs": []
+  }
+}

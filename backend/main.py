@@ -923,3 +923,11 @@ async def schedule_appointment(
     except Exception as e:
         print(f"Firestore Error: {e}")
         raise HTTPException(status_code=500, detail="Failed to save appointment to database")
+
+# Import notification and cache services
+from notification_service import NotificationService
+from cache_service import CacheService
+
+# Initialize services
+notification_service = NotificationService()
+cache_service = CacheService()
