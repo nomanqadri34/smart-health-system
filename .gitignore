@@ -1,0 +1,71 @@
+# Repo evaluator folder
+repo_evaluator-main-new-2-no-llm/
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+*.egg-info/
+dist/
+build/
+.venv/
+venv/
+ENV/
+
+# Node
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# Environment variables
+.env
+.env.local
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Database
+*.db
+*.sqlite
+*.sqlite3
+
+# Generator and PR creation scripts
+batch_generate_modules.py
+bulk_module_generator.py
+ultra_fast_generator.py
+fast_bulk_gen.py
+generate_90k_loc.py
+generate_90k_complete.py
+generate_remaining_loc.py
+generate_large_modules.py
+final_module_batch.py
+create_*_prs.py
+create_pr_batch.py
+create_prs_api.py
+create_github_prs.py
+create_issues_for_f2p.py
+create_f2p_prs.py
+check_pr_status.py
+check_prerequisites.py
+add_test_framework.py
+run_f2p_workflow.py
+verify_f2p.py
+
+# F2P documentation files
+F2P_*.md
+F2P_*.txt
+FILES_CREATED.txt
+README_F2P_PRS.md
+README_COMPLETE.md
+START_HERE.md
+QUICKSTART.md
