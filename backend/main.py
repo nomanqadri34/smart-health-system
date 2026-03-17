@@ -996,3 +996,30 @@ from search_query_v2 import SearchQuery
 search_indexer_v2_service = SearchIndexer(config={"enabled": True})
 search_query_v2_service = SearchQuery(config={"enabled": True})
 
+# ===========================================================================
+# NEW MODULE ROUTE REGISTRATIONS
+# ===========================================================================
+
+from health_vitals import register_vitals_routes
+from lab_reports import register_lab_report_routes
+from medication_reminders import register_medication_routes
+from emergency_alerts import register_emergency_routes
+from doctor_availability import register_availability_routes
+from health_goals import register_health_goals_routes
+from telemedicine import register_telemedicine_routes
+from patient_history import register_patient_history_routes
+from appointment_waitlist import register_waitlist_routes
+from health_analytics_ml import register_health_analytics_routes
+
+# Register all routes onto the FastAPI app
+register_vitals_routes(app, db, get_current_user, log_action, serialize_doc)
+register_lab_report_routes(app, db, get_current_user, log_action, serialize_doc)
+register_medication_routes(app, db, get_current_user, log_action, serialize_doc)
+register_emergency_routes(app, db, get_current_user, log_action, serialize_doc)
+register_availability_routes(app, db, get_current_user, log_action, serialize_doc)
+register_health_goals_routes(app, db, get_current_user, log_action, serialize_doc)
+register_telemedicine_routes(app, db, get_current_user, log_action, serialize_doc)
+register_patient_history_routes(app, db, get_current_user, log_action, serialize_doc)
+register_waitlist_routes(app, db, get_current_user, log_action, serialize_doc)
+register_health_analytics_routes(app, db, get_current_user, log_action, serialize_doc)
+
