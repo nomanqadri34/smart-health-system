@@ -6,7 +6,7 @@ from fastapi import Depends, HTTPException, Query
 from pydantic import BaseModel, validator, Field
 from typing import List, Optional, Dict
 from datetime import datetime, timedelta, time
-from firebase_admin import firestore
+from bson import ObjectId
 
 
 # ─────────────────────────────────────────────────────
@@ -170,7 +170,7 @@ def register_medication_routes(app, db, get_current_user, log_action, serialize_
 
     # ── POST /api/medications ── Create new medication schedule
     @app.post("/api/medications")
-    def create_medication_schedule(
+    async def create_medication_schedule(
         med: MedicationSchedule,
         current_user: dict = Depends(get_current_user),
     ):
@@ -180,20 +180,20 @@ def register_medication_routes(app, db, get_current_user, log_action, serialize_
             data["patient_id"] = current_user["uid"]
             data["patient_email"] = current_user.get("email", "")
             data["active"] = True
-            data["created_at"] = firestore.SERVER_TIMESTAMP
+            data["created_at"] = datetime.utcnow()
             # Auto-fill times if not provided
             if not data.get("times_of_day"):
                 data["times_of_day"] = FREQUENCY_TIMES.get(med.frequency, ["08:00"])
             data["next_doses"] = get_next_doses(data, count=5)
-            ref = db.collection("medication_schedules").add(data)
-            log_action(current_user, "add_medication", {"med": med.medication_name})
-            return {"status": "success", "id": ref[1].id, "next_doses": data["next_doses"]}
+            result = await db.medication_schedules.insert_one(data)
+            await log_action(current_user, "add_medication", {"med": med.medication_name})
+            return {"status": "success", "id": str(result.inserted_id), "next_doses": data["next_doses"]}
         except Exception as e:
             raise HTTPException(status_code=500, detail=str(e))
 
     # ── GET /api/medications ── Get all active medications
     @app.get("/api/medications")
-    def get_medications(
+    async def get_medications(
         patient_id: Optional[str] = Query(None),
         active_only: bool = Query(True),
         current_user: dict = Depends(get_current_user),
@@ -204,15 +204,14 @@ def register_medication_routes(app, db, get_current_user, log_action, serialize_
         if role in ["superuser", "admin", "superadmin", "doctor"] and patient_id:
             uid = patient_id
 
-        query = db.collection("medication_schedules").where("patient_id", "==", uid)
+        mongo_query = {"patient_id": uid}
         if active_only:
-            query = query.where("active", "==", True)
+            mongo_query["active"] = True
 
         medications = []
-        for doc in query.stream():
-            d = doc.to_dict()
-            d["id"] = doc.id
-            d = serialize_doc(d)
+        cursor = db.medication_schedules.find(mongo_query)
+        async for doc in cursor:
+            d = serialize_doc(doc)
             # Recompute next doses on fetch
             d["next_doses"] = get_next_doses(d, count=3)
             medications.append(d)
@@ -229,13 +228,12 @@ def register_medication_routes(app, db, get_current_user, log_action, serialize_
 
     # ── GET /api/medications/{med_id} ── Single medication detail
     @app.get("/api/medications/{med_id}")
-    def get_single_medication(med_id: str, current_user: dict = Depends(get_current_user)):
-        doc = db.collection("medication_schedules").document(med_id).get()
-        if not doc.exists:
+    async def get_single_medication(med_id: str, current_user: dict = Depends(get_current_user)):
+        query = {"_id": ObjectId(med_id)} if ObjectId.is_valid(med_id) else {"medication_id": med_id}
+        doc = await db.medication_schedules.find_one(query)
+        if not doc:
             raise HTTPException(status_code=404, detail="Medication schedule not found")
-        d = doc.to_dict()
-        d["id"] = doc.id
-        d = serialize_doc(d)
+        d = serialize_doc(doc)
         if current_user["role"] == "patient" and d.get("patient_id") != current_user["uid"]:
             raise HTTPException(status_code=403, detail="Not authorized")
         d["next_doses"] = get_next_doses(d, count=5)
@@ -243,42 +241,40 @@ def register_medication_routes(app, db, get_current_user, log_action, serialize_
 
     # ── PATCH /api/medications/{med_id} ── Update schedule
     @app.patch("/api/medications/{med_id}")
-    def update_medication(
+    async def update_medication(
         med_id: str,
         update: MedicationUpdate,
         current_user: dict = Depends(get_current_user),
     ):
-        doc_ref = db.collection("medication_schedules").document(med_id)
-        doc = doc_ref.get()
-        if not doc.exists:
+        query = {"_id": ObjectId(med_id)} if ObjectId.is_valid(med_id) else {"medication_id": med_id}
+        doc = await db.medication_schedules.find_one(query)
+        if not doc:
             raise HTTPException(status_code=404, detail="Medication schedule not found")
-        d = doc.to_dict()
-        if current_user["role"] == "patient" and d.get("patient_id") != current_user["uid"]:
+        if current_user["role"] == "patient" and doc.get("patient_id") != current_user["uid"]:
             raise HTTPException(status_code=403, detail="Not authorized")
         patch = {k: v for k, v in update.dict().items() if v is not None}
-        patch["updated_at"] = firestore.SERVER_TIMESTAMP
-        doc_ref.update(patch)
-        log_action(current_user, "update_medication", {"id": med_id})
+        patch["updated_at"] = datetime.utcnow()
+        await db.medication_schedules.update_one(query, {"$set": patch})
+        await log_action(current_user, "update_medication", {"id": med_id})
         return {"status": "success", "updated_fields": list(patch.keys())}
 
     # ── DELETE /api/medications/{med_id} ── Stop/delete a medication
     @app.delete("/api/medications/{med_id}")
-    def delete_medication(med_id: str, current_user: dict = Depends(get_current_user)):
-        doc_ref = db.collection("medication_schedules").document(med_id)
-        doc = doc_ref.get()
-        if not doc.exists:
+    async def delete_medication(med_id: str, current_user: dict = Depends(get_current_user)):
+        query = {"_id": ObjectId(med_id)} if ObjectId.is_valid(med_id) else {"medication_id": med_id}
+        doc = await db.medication_schedules.find_one(query)
+        if not doc:
             raise HTTPException(status_code=404, detail="Medication schedule not found")
-        d = doc.to_dict()
-        if current_user["role"] == "patient" and d.get("patient_id") != current_user["uid"]:
+        if current_user["role"] == "patient" and doc.get("patient_id") != current_user["uid"]:
             raise HTTPException(status_code=403, detail="Not authorized")
         # Soft delete: mark as inactive
-        doc_ref.update({"active": False, "stopped_at": firestore.SERVER_TIMESTAMP})
-        log_action(current_user, "stop_medication", {"id": med_id})
+        await db.medication_schedules.update_one(query, {"$set": {"active": False, "stopped_at": datetime.utcnow()}})
+        await log_action(current_user, "stop_medication", {"id": med_id})
         return {"status": "success", "message": "Medication schedule stopped"}
 
     # ── POST /api/medications/adherence ── Log a dose taken/skipped
     @app.post("/api/medications/adherence")
-    def log_adherence(
+    async def log_adherence(
         log_data: AdherenceLog,
         current_user: dict = Depends(get_current_user),
     ):
@@ -286,30 +282,29 @@ def register_medication_routes(app, db, get_current_user, log_action, serialize_
         try:
             data = log_data.dict()
             data["patient_id"] = current_user["uid"]
-            data["logged_at"] = firestore.SERVER_TIMESTAMP
-            ref = db.collection("medication_adherence").add(data)
-            return {"status": "success", "log_id": ref[1].id}
+            data["logged_at"] = datetime.utcnow()
+            result = await db.medication_adherence.insert_one(data)
+            return {"status": "success", "log_id": str(result.inserted_id)}
         except Exception as e:
             raise HTTPException(status_code=500, detail=str(e))
 
     # ── GET /api/medications/adherence/{med_id} ── Adherence stats for a medication
     @app.get("/api/medications/adherence/{med_id}")
-    def get_adherence_stats(
+    async def get_adherence_stats(
         med_id: str,
         days: int = Query(30),
         current_user: dict = Depends(get_current_user),
     ):
         """Get adherence statistics for a specific medication over N days."""
         cutoff = (datetime.utcnow() - timedelta(days=days)).isoformat()
-        docs = db.collection("medication_adherence") \
-            .where("schedule_id", "==", med_id) \
-            .where("patient_id", "==", current_user["uid"]).stream()
+        cursor = db.medication_adherence.find({
+            "schedule_id": med_id,
+            "patient_id": current_user["uid"]
+        })
 
         logs = []
-        for doc in docs:
-            d = doc.to_dict()
-            d["id"] = doc.id
-            d = serialize_doc(d)
+        async for doc in cursor:
+            d = serialize_doc(doc)
             if d.get("scheduled_time", "") >= cutoff:
                 logs.append(d)
 
@@ -323,7 +318,7 @@ def register_medication_routes(app, db, get_current_user, log_action, serialize_
 
     # ── POST /api/medications/refill-request ── Request a refill
     @app.post("/api/medications/refill-request")
-    def request_refill(
+    async def request_refill(
         refill: RefillRequest,
         current_user: dict = Depends(get_current_user),
     ):
@@ -333,31 +328,28 @@ def register_medication_routes(app, db, get_current_user, log_action, serialize_
             data["patient_id"] = current_user["uid"]
             data["patient_email"] = current_user.get("email", "")
             data["status"] = "pending"
-            data["requested_at"] = firestore.SERVER_TIMESTAMP
-            ref = db.collection("refill_requests").add(data)
-            log_action(current_user, "refill_request", {"med": refill.medication_name})
-            return {"status": "success", "refill_id": ref[1].id}
+            data["requested_at"] = datetime.utcnow()
+            result = await db.refill_requests.insert_one(data)
+            await log_action(current_user, "refill_request", {"med": refill.medication_name})
+            return {"status": "success", "refill_id": str(result.inserted_id)}
         except Exception as e:
             raise HTTPException(status_code=500, detail=str(e))
 
     # ── GET /api/medications/refills/pending ── Doctor views pending refills
     @app.get("/api/medications/refills/pending")
-    def get_pending_refills(current_user: dict = Depends(get_current_user)):
+    async def get_pending_refills(current_user: dict = Depends(get_current_user)):
         """Doctors can view all pending refill requests."""
         if current_user["role"] not in ["doctor", "superuser", "admin", "superadmin"]:
             raise HTTPException(status_code=403, detail="Not authorized")
-        docs = db.collection("refill_requests").where("status", "==", "pending").stream()
+        cursor = db.refill_requests.find({"status": "pending"})
         refills = []
-        for doc in docs:
-            d = doc.to_dict()
-            d["id"] = doc.id
-            d = serialize_doc(d)
-            refills.append(d)
+        async for doc in cursor:
+            refills.append(serialize_doc(doc))
         return {"refills": refills, "count": len(refills)}
 
     # ── GET /api/medications/adherence/overview ── Overall adherence for all active meds
     @app.get("/api/medications/adherence/overview")
-    def get_overall_adherence(
+    async def get_overall_adherence(
         days: int = Query(30),
         patient_id: Optional[str] = Query(None),
         current_user: dict = Depends(get_current_user),
@@ -369,13 +361,11 @@ def register_medication_routes(app, db, get_current_user, log_action, serialize_
             uid = patient_id
 
         cutoff = (datetime.utcnow() - timedelta(days=days)).isoformat()
-        docs = db.collection("medication_adherence") \
-            .where("patient_id", "==", uid).stream()
+        cursor = db.medication_adherence.find({"patient_id": uid})
 
         logs = []
-        for doc in docs:
-            d = doc.to_dict()
-            d = serialize_doc(d)
+        async for doc in cursor:
+            d = serialize_doc(doc)
             if d.get("scheduled_time", "") >= cutoff:
                 logs.append(d)
 

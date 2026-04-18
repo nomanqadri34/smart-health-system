@@ -6,7 +6,7 @@ from fastapi import Depends, HTTPException
 from pydantic import BaseModel
 from typing import List, Optional
 from datetime import datetime
-from firebase_admin import firestore
+from bson import ObjectId
 
 # ─────────────────────────────────────────────────────
 # Pydantic Models
@@ -67,54 +67,51 @@ def register_emergency_routes(app, db, get_current_user, log_action, serialize_d
 
     # ── POST /api/emergency/contacts ── Add emergency contact
     @app.post("/api/emergency/contacts")
-    def add_emergency_contact(contact: EmergencyContact, current_user: dict = Depends(get_current_user)):
+    async def add_emergency_contact(contact: EmergencyContact, current_user: dict = Depends(get_current_user)):
         try:
             data = contact.dict()
             data["patient_id"] = current_user["uid"]
-            data["created_at"] = firestore.SERVER_TIMESTAMP
-            ref = db.collection("emergency_contacts").add(data)
-            return {"status": "success", "id": ref[1].id}
+            data["created_at"] = datetime.utcnow()
+            result = await db.emergency_contacts.insert_one(data)
+            return {"status": "success", "id": str(result.inserted_id)}
         except Exception as e:
             raise HTTPException(status_code=500, detail=str(e))
 
     # ── GET /api/emergency/contacts ── Get emergency contacts
     @app.get("/api/emergency/contacts")
-    def get_emergency_contacts(current_user: dict = Depends(get_current_user)):
-        docs = db.collection("emergency_contacts").where("patient_id", "==", current_user["uid"]).stream()
+    async def get_emergency_contacts(current_user: dict = Depends(get_current_user)):
+        cursor = db.emergency_contacts.find({"patient_id": current_user["uid"]})
         contacts = []
-        for doc in docs:
-            d = doc.to_dict()
-            d["id"] = doc.id
-            d = serialize_doc(d)
-            contacts.append(d)
+        async for doc in cursor:
+            contacts.append(serialize_doc(doc))
         return contacts
 
     # ── DELETE /api/emergency/contacts/{contact_id} ── Delete emergency contact
     @app.delete("/api/emergency/contacts/{contact_id}")
-    def delete_emergency_contact(contact_id: str, current_user: dict = Depends(get_current_user)):
-        doc_ref = db.collection("emergency_contacts").document(contact_id)
-        doc = doc_ref.get()
-        if not doc.exists or doc.to_dict().get("patient_id") != current_user["uid"]:
+    async def delete_emergency_contact(contact_id: str, current_user: dict = Depends(get_current_user)):
+        query = {"_id": ObjectId(contact_id)} if ObjectId.is_valid(contact_id) else {"contact_id": contact_id}
+        doc = await db.emergency_contacts.find_one(query)
+        if not doc or doc.get("patient_id") != current_user["uid"]:
             raise HTTPException(status_code=403, detail="Not authorized")
-        doc_ref.delete()
+        await db.emergency_contacts.delete_one(query)
         return {"status": "success"}
 
     # ── POST /api/emergency/sos ── Trigger SOS Alert
     @app.post("/api/emergency/sos")
-    def trigger_sos(sos: SOSRequest, current_user: dict = Depends(get_current_user)):
+    async def trigger_sos(sos: SOSRequest, current_user: dict = Depends(get_current_user)):
         try:
             data = sos.dict()
             data["patient_id"] = current_user["uid"]
             data["patient_email"] = current_user.get("email", "")
             data["patient_name"] = current_user.get("full_name", "")
             data["status"] = "active"
-            data["triggered_at"] = firestore.SERVER_TIMESTAMP
+            data["triggered_at"] = datetime.utcnow()
 
             # Fetch emergency contacts
             contacts = []
-            contact_docs = db.collection("emergency_contacts").where("patient_id", "==", current_user["uid"]).stream()
-            for doc in contact_docs:
-                contacts.append(doc.to_dict())
+            cursor = db.emergency_contacts.find({"patient_id": current_user["uid"]})
+            async for doc in cursor:
+                contacts.append(doc)
 
             # Notifications & Dispatch
             notifs = notify_emergency_contacts(contacts, data["patient_name"], data["location"])
@@ -123,12 +120,12 @@ def register_emergency_routes(app, db, get_current_user, log_action, serialize_d
             if sos.requires_ambulance:
                 data["ambulance_info"] = dispatch_ambulance(data["location"], data["patient_id"])
 
-            ref = db.collection("sos_alerts").add(data)
-            log_action(current_user, "triggered_sos", {"location": data["location"]})
+            result = await db.sos_alerts.insert_one(data)
+            await log_action(current_user, "triggered_sos", {"location": data["location"]})
             
             return {
                 "status": "success",
-                "alert_id": ref[1].id,
+                "alert_id": str(result.inserted_id),
                 "ambulance_info": data.get("ambulance_info")
             }
         except Exception as e:
@@ -136,17 +133,14 @@ def register_emergency_routes(app, db, get_current_user, log_action, serialize_d
 
     # ── GET /api/emergency/active ── Admin/Doctor view active emergencies
     @app.get("/api/emergency/active")
-    def get_active_emergencies(current_user: dict = Depends(get_current_user)):
+    async def get_active_emergencies(current_user: dict = Depends(get_current_user)):
         if current_user["role"] not in ["superuser", "admin", "superadmin", "doctor"]:
             raise HTTPException(status_code=403, detail="Not authorized")
             
-        docs = db.collection("sos_alerts").where("status", "==", "active").stream()
+        cursor = db.sos_alerts.find({"status": "active"})
         alerts = []
-        for doc in docs:
-            d = doc.to_dict()
-            d["id"] = doc.id
-            d = serialize_doc(d)
-            alerts.append(d)
+        async for doc in cursor:
+            alerts.append(serialize_doc(doc))
         
         # Sort by most recent
         alerts.sort(key=lambda x: x.get("triggered_at", ""), reverse=True)
@@ -154,19 +148,20 @@ def register_emergency_routes(app, db, get_current_user, log_action, serialize_d
 
     # ── PATCH /api/emergency/{alert_id} ── Update SOS Alert Status
     @app.patch("/api/emergency/{alert_id}")
-    def update_emergency_status(alert_id: str, update: AlertUpdate, current_user: dict = Depends(get_current_user)):
+    async def update_emergency_status(alert_id: str, update: AlertUpdate, current_user: dict = Depends(get_current_user)):
         if current_user["role"] not in ["superuser", "admin", "superadmin", "doctor"]:
             raise HTTPException(status_code=403, detail="Not authorized")
             
-        doc_ref = db.collection("sos_alerts").document(alert_id)
-        if not doc_ref.get().exists:
+        query = {"_id": ObjectId(alert_id)} if ObjectId.is_valid(alert_id) else {"alert_id": alert_id}
+        doc = await db.sos_alerts.find_one(query)
+        if not doc:
             raise HTTPException(status_code=404, detail="Alert not found")
             
         patch = update.dict(exclude_unset=True)
-        patch["updated_at"] = firestore.SERVER_TIMESTAMP
+        patch["updated_at"] = datetime.utcnow()
         if patch.get("status") == "resolved":
-            patch["resolved_at"] = firestore.SERVER_TIMESTAMP
+            patch["resolved_at"] = datetime.utcnow()
             
-        doc_ref.update(patch)
-        log_action(current_user, "update_sos", {"alert_id": alert_id, "status": update.status})
+        await db.sos_alerts.update_one(query, {"$set": patch})
+        await log_action(current_user, "update_sos", {"alert_id": alert_id, "status": update.status})
         return {"status": "success"}

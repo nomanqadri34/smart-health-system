@@ -6,7 +6,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel
 from typing import List, Optional, Dict
 from datetime import datetime, timedelta
-from firebase_admin import firestore
+from bson import ObjectId
 
 # ─────────────────────────────────────────────────────
 # Pydantic Models
@@ -96,25 +96,29 @@ def register_availability_routes(app, db, get_current_user, log_action, serializ
 
     # ── POST /api/schedule/config ── Set Doctor Schedule Config
     @app.post("/api/schedule/config")
-    def set_schedule_config(config: DoctorScheduleConfig, current_user: dict = Depends(get_current_user)):
+    async def set_schedule_config(config: DoctorScheduleConfig, current_user: dict = Depends(get_current_user)):
         if current_user["role"] != "doctor":
             raise HTTPException(status_code=403, detail="Only doctors can manage their schedules")
             
         data = config.dict()
-        data["updated_at"] = firestore.SERVER_TIMESTAMP
-        db.collection("doctor_schedules").document(current_user["uid"]).set(data)
-        log_action(current_user, "update_schedule_config")
+        data["updated_at"] = datetime.utcnow()
+        await db.doctor_schedules.update_one(
+            {"_id": current_user["uid"]},
+            {"$set": data},
+            upsert=True
+        )
+        await log_action(current_user, "update_schedule_config")
         return {"status": "success"}
 
     # ── GET /api/schedule/config ── Get Doctor Schedule Config
     @app.get("/api/schedule/config")
-    def get_schedule_config(doctor_id: Optional[str] = Query(None), current_user: dict = Depends(get_current_user)):
+    async def get_schedule_config(doctor_id: Optional[str] = Query(None), current_user: dict = Depends(get_current_user)):
         target_id = current_user["uid"]
         if doctor_id and current_user["role"] in ["superuser", "admin", "superadmin", "patient"]:
              target_id = doctor_id
              
-        doc = db.collection("doctor_schedules").document(target_id).get()
-        if not doc.exists:
+        doc = await db.doctor_schedules.find_one({"_id": target_id})
+        if not doc:
             # Return default config
             return {
                 "slot_duration_minutes": 30,
@@ -124,51 +128,49 @@ def register_availability_routes(app, db, get_current_user, log_action, serializ
                     for i in range(7)
                 ]
             }
-        return serialize_doc(doc.to_dict())
+        return serialize_doc(doc)
 
     # ── POST /api/schedule/time-off ── Add Time Off
     @app.post("/api/schedule/time-off")
-    def add_time_off(request: TimeOffRequest, current_user: dict = Depends(get_current_user)):
+    async def add_time_off(request: TimeOffRequest, current_user: dict = Depends(get_current_user)):
         if current_user["role"] != "doctor":
             raise HTTPException(status_code=403, detail="Only doctors can request time off")
             
         data = request.dict()
         data["doctor_id"] = current_user["uid"]
-        data["created_at"] = firestore.SERVER_TIMESTAMP
-        ref = db.collection("time_offs").add(data)
-        log_action(current_user, "add_time_off")
-        return {"status": "success", "id": ref[1].id}
+        data["created_at"] = datetime.utcnow()
+        result = await db.time_offs.insert_one(data)
+        await log_action(current_user, "add_time_off")
+        return {"status": "success", "id": str(result.inserted_id)}
 
     # ── GET /api/schedule/time-off ── Get Time Offs
     @app.get("/api/schedule/time-off")
-    def get_time_offs(doctor_id: Optional[str] = Query(None), current_user: dict = Depends(get_current_user)):
+    async def get_time_offs(doctor_id: Optional[str] = Query(None), current_user: dict = Depends(get_current_user)):
         target_id = current_user["uid"] if current_user["role"] == "doctor" else doctor_id
         if not target_id:
             raise HTTPException(status_code=400, detail="Doctor ID required")
             
-        docs = db.collection("time_offs").where("doctor_id", "==", target_id).stream()
+        cursor = db.time_offs.find({"doctor_id": target_id})
         results = []
-        for doc in docs:
-            d = doc.to_dict()
-            d["id"] = doc.id
-            results.append(serialize_doc(d))
+        async for doc in cursor:
+            results.append(serialize_doc(doc))
         return results
 
     # ── DELETE /api/schedule/time-off/{time_off_id} ── Delete Time Off
     @app.delete("/api/schedule/time-off/{time_off_id}")
-    def delete_time_off(time_off_id: str, current_user: dict = Depends(get_current_user)):
+    async def delete_time_off(time_off_id: str, current_user: dict = Depends(get_current_user)):
         if current_user["role"] != "doctor":
              raise HTTPException(status_code=403, detail="Not authorized")
-        doc_ref = db.collection("time_offs").document(time_off_id)
-        doc = doc_ref.get()
-        if not doc.exists or doc.to_dict().get("doctor_id") != current_user["uid"]:
+        query = {"_id": ObjectId(time_off_id)} if ObjectId.is_valid(time_off_id) else {"time_off_id": time_off_id}
+        doc = await db.time_offs.find_one(query)
+        if not doc or doc.get("doctor_id") != current_user["uid"]:
              raise HTTPException(status_code=403, detail="Not authorized")
-        doc_ref.delete()
+        await db.time_offs.delete_one(query)
         return {"status": "success"}
 
     # ── GET /api/schedule/slots ── Get Available Slots for a Doctor
     @app.get("/api/schedule/slots")
-    def get_available_slots(doctor_id: str, date: str = Query(...), current_user: dict = Depends(get_current_user)):
+    async def get_available_slots(doctor_id: str, date: str = Query(...), current_user: dict = Depends(get_current_user)):
         """Generate available slots for a specific doctor and date."""
         try:
             target_date = datetime.strptime(date, "%Y-%m-%d")
@@ -176,9 +178,9 @@ def register_availability_routes(app, db, get_current_user, log_action, serializ
             raise HTTPException(status_code=400, detail="Invalid date format, use YYYY-MM-DD")
 
         # 1. Get Schedule Config
-        config_doc = db.collection("doctor_schedules").document(doctor_id).get()
-        if config_doc.exists:
-            config = config_doc.to_dict()
+        config_doc = await db.doctor_schedules.find_one({"_id": doctor_id})
+        if config_doc:
+            config = config_doc
         else:
             # Default Mon-Fri 9-5 config
             config = {
@@ -191,15 +193,20 @@ def register_availability_routes(app, db, get_current_user, log_action, serializ
             }
 
         # 2. Get Time Offs
-        to_docs = db.collection("time_offs").where("doctor_id", "==", doctor_id).stream()
-        time_offs = [doc.to_dict() for doc in to_docs]
+        to_cursor = db.time_offs.find({"doctor_id": doctor_id})
+        time_offs = []
+        async for doc in to_cursor:
+            time_offs.append(doc)
 
         # 3. Get Existing Appointments (by finding doctor email first)
-        user_doc = db.collection("users").document(doctor_id).get()
-        doctor_email = user_doc.to_dict().get("email", "") if user_doc.exists else ""
+        user_query = {"_id": ObjectId(doctor_id)} if ObjectId.is_valid(doctor_id) else {"uid": doctor_id}
+        user_doc = await db.users.find_one(user_query)
+        doctor_email = user_doc.get("email", "") if user_doc else ""
         
-        appt_docs = db.collection("appointments").where("doctor_email", "==", doctor_email).where("date", "==", date).stream()
-        existing_appointments = [doc.to_dict() for doc in appt_docs]
+        appt_cursor = db.appointments.find({"doctor_email": doctor_email, "date": date})
+        existing_appointments = []
+        async for doc in appt_cursor:
+            existing_appointments.append(doc)
 
         # 4. Generate slots
         slots = generate_slots_for_date(target_date, config, time_offs, existing_appointments)

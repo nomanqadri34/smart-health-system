@@ -7,7 +7,7 @@ from pydantic import BaseModel
 from typing import List, Optional
 from datetime import datetime
 import uuid
-from firebase_admin import firestore
+from bson import ObjectId
 
 # ─────────────────────────────────────────────────────
 # Pydantic Models
@@ -35,7 +35,7 @@ def register_telemedicine_routes(app, db, get_current_user, log_action, serializ
 
     # ── POST /api/telemedicine/session ── Create a video session (Doctor/Admin)
     @app.post("/api/telemedicine/session")
-    def create_telemedicine_session(session: TelemedicineSessionCreate, current_user: dict = Depends(get_current_user)):
+    async def create_telemedicine_session(session: TelemedicineSessionCreate, current_user: dict = Depends(get_current_user)):
         if current_user["role"] not in ["doctor", "admin", "superadmin", "superuser"]:
             raise HTTPException(status_code=403, detail="Not authorized")
             
@@ -46,84 +46,89 @@ def register_telemedicine_routes(app, db, get_current_user, log_action, serializ
         data["meeting_id"] = meeting_id
         data["join_url"] = join_url
         data["status"] = "scheduled" # scheduled, active, completed, cancelled
-        data["created_at"] = firestore.SERVER_TIMESTAMP
+        data["created_at"] = datetime.utcnow()
         
-        ref = db.collection("telemedicine_sessions").add(data)
+        result = await db.telemedicine_sessions.insert_one(data)
+        session_doc_id = str(result.inserted_id)
         
-        # Optionally link this session to the appointment document
-        db.collection("appointments").document(session.appointment_id).update({
-            "is_telemedicine": True,
-            "telemedicine_session_id": ref[1].id,
-            "meeting_url": join_url
+        # Link this session to the appointment document
+        apt_query = {"_id": ObjectId(session.appointment_id)} if ObjectId.is_valid(session.appointment_id) else {"appointment_id": session.appointment_id}
+        await db.appointments.update_one(apt_query, {
+            "$set": {
+                "is_telemedicine": True,
+                "telemedicine_session_id": session_doc_id,
+                "meeting_url": join_url
+            }
         })
         
-        log_action(current_user, "create_telemed_session", {"appointment": session.appointment_id})
-        return {"status": "success", "session_id": ref[1].id, "join_url": join_url, "meeting_id": meeting_id}
+        await log_action(current_user, "create_telemed_session", {"appointment": session.appointment_id})
+        return {"status": "success", "session_id": session_doc_id, "join_url": join_url, "meeting_id": meeting_id}
 
     # ── GET /api/telemedicine/sessions ── Get user's sessions
     @app.get("/api/telemedicine/sessions")
-    def get_telemedicine_sessions(current_user: dict = Depends(get_current_user)):
+    async def get_telemedicine_sessions(current_user: dict = Depends(get_current_user)):
+        mongo_query = {}
         if current_user["role"] == "doctor":
-            query = db.collection("telemedicine_sessions").where("host_doctor_id", "==", current_user["uid"])
+            mongo_query = {"host_doctor_id": current_user["uid"]}
         else:
-            query = db.collection("telemedicine_sessions").where("patient_id", "==", current_user["uid"])
+            mongo_query = {"patient_id": current_user["uid"]}
             
-        docs = query.stream()
+        cursor = db.telemedicine_sessions.find(mongo_query)
         sessions = []
-        for doc in docs:
-            d = doc.to_dict()
-            d["id"] = doc.id
-            sessions.append(serialize_doc(d))
+        async for doc in cursor:
+            sessions.append(serialize_doc(doc))
             
         return sessions
 
     # ── GET /api/telemedicine/session/{session_id}/join ── Get join details
     @app.get("/api/telemedicine/session/{session_id}/join")
-    def join_session(session_id: str, current_user: dict = Depends(get_current_user)):
-        doc_ref = db.collection("telemedicine_sessions").document(session_id)
-        doc = doc_ref.get()
-        if not doc.exists:
+    async def join_session(session_id: str, current_user: dict = Depends(get_current_user)):
+        query = {"_id": ObjectId(session_id)} if ObjectId.is_valid(session_id) else {"session_id": session_id}
+        doc = await db.telemedicine_sessions.find_one(query)
+        if not doc:
              raise HTTPException(status_code=404, detail="Session not found")
         
-        data = doc.to_dict()
-        if data.get("patient_id") != current_user["uid"] and data.get("host_doctor_id") != current_user["uid"] and current_user["role"] not in ["admin", "superadmin", "superuser"]:
+        if doc.get("patient_id") != current_user["uid"] and doc.get("host_doctor_id") != current_user["uid"] and current_user["role"] not in ["admin", "superadmin", "superuser"]:
             raise HTTPException(status_code=403, detail="Not authorized to join this session")
             
-        if data.get("status") == "scheduled":
+        if doc.get("status") == "scheduled":
              # Mark as active if doctor is joining
-             if current_user["uid"] == data.get("host_doctor_id"):
-                  doc_ref.update({"status": "active", "started_at": firestore.SERVER_TIMESTAMP})
+             if current_user["uid"] == doc.get("host_doctor_id"):
+                  await db.telemedicine_sessions.update_one(query, {"$set": {"status": "active", "started_at": datetime.utcnow()}})
                   
         return {
-            "join_url": data.get("join_url"),
-            "meeting_id": data.get("meeting_id"),
-            "status": data.get("status")
+            "join_url": doc.get("join_url"),
+            "meeting_id": doc.get("meeting_id"),
+            "status": doc.get("status")
         }
 
     # ── POST /api/telemedicine/session/{session_id}/end ── End session and add notes
     @app.post("/api/telemedicine/session/{session_id}/end")
-    def end_session(session_id: str, notes: TelemedicineNotes, current_user: dict = Depends(get_current_user)):
-        doc_ref = db.collection("telemedicine_sessions").document(session_id)
-        doc = doc_ref.get()
-        if not doc.exists:
+    async def end_session(session_id: str, notes: TelemedicineNotes, current_user: dict = Depends(get_current_user)):
+        query = {"_id": ObjectId(session_id)} if ObjectId.is_valid(session_id) else {"session_id": session_id}
+        doc = await db.telemedicine_sessions.find_one(query)
+        if not doc:
              raise HTTPException(status_code=404, detail="Session not found")
              
-        data = doc.to_dict()
-        if current_user["uid"] != data.get("host_doctor_id") and current_user["role"] not in ["admin", "superadmin", "superuser"]:
+        if current_user["uid"] != doc.get("host_doctor_id") and current_user["role"] not in ["admin", "superadmin", "superuser"]:
             raise HTTPException(status_code=403, detail="Only the host doctor can end the session")
             
-        doc_ref.update({
-             "status": "completed",
-             "ended_at": firestore.SERVER_TIMESTAMP,
-             "clinical_notes": notes.dict()
+        await db.telemedicine_sessions.update_one(query, {
+            "$set": {
+                 "status": "completed",
+                 "ended_at": datetime.utcnow(),
+                 "clinical_notes": notes.dict()
+            }
         })
         
         # Update Appointment status
-        if data.get("appointment_id"):
+        apt_id = doc.get("appointment_id")
+        if apt_id:
              try:
-                  db.collection("appointments").document(data.get("appointment_id")).update({"status": "completed"})
+                  apt_query = {"_id": ObjectId(apt_id)} if ObjectId.is_valid(apt_id) else {"appointment_id": apt_id}
+                  await db.appointments.update_one(apt_query, {"$set": {"status": "completed"}})
              except Exception:
                   pass
                   
-        log_action(current_user, "end_telemed_session", {"session_id": session_id})
+        await log_action(current_user, "end_telemed_session", {"session_id": session_id})
         return {"status": "success"}

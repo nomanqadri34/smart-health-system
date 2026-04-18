@@ -6,7 +6,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel
 from typing import List, Optional
 from datetime import datetime
-from firebase_admin import firestore
+from bson import ObjectId
 
 class WaitlistEntryCreate(BaseModel):
     doctor_id: str
@@ -20,35 +20,34 @@ def register_waitlist_routes(app, db, get_current_user, log_action, serialize_do
 
     # ── POST /api/waitlist ── Join Waitlist
     @app.post("/api/waitlist")
-    def join_waitlist(entry: WaitlistEntryCreate, current_user: dict = Depends(get_current_user)):
+    async def join_waitlist(entry: WaitlistEntryCreate, current_user: dict = Depends(get_current_user)):
         data = entry.dict()
         data["patient_id"] = current_user["uid"]
         data["patient_email"] = current_user.get("email", "")
         data["status"] = "waiting" # waiting, notified, booked, cancelled
-        data["joined_at"] = firestore.SERVER_TIMESTAMP
+        data["joined_at"] = datetime.utcnow()
         
-        ref = db.collection("waitlists").add(data)
-        log_action(current_user, "join_waitlist", {"doctor": entry.doctor_id})
-        return {"status": "success", "waitlist_id": ref[1].id}
+        result = await db.waitlists.insert_one(data)
+        await log_action(current_user, "join_waitlist", {"doctor": entry.doctor_id})
+        return {"status": "success", "waitlist_id": str(result.inserted_id)}
 
     # ── GET /api/waitlist ── Get Waitlist entries for Doctor
     @app.get("/api/waitlist")
-    def get_waitlist(doctor_id: Optional[str] = Query(None), current_user: dict = Depends(get_current_user)):
+    async def get_waitlist(doctor_id: Optional[str] = Query(None), current_user: dict = Depends(get_current_user)):
+        mongo_query = {}
         if current_user["role"] == "doctor":
-             query = db.collection("waitlists").where("doctor_id", "==", current_user["uid"]).where("status", "==", "waiting")
+             mongo_query = {"doctor_id": current_user["uid"], "status": "waiting"}
         elif current_user["role"] in ["superuser", "admin", "superadmin"] and doctor_id:
-             query = db.collection("waitlists").where("doctor_id", "==", doctor_id).where("status", "==", "waiting")
+             mongo_query = {"doctor_id": doctor_id, "status": "waiting"}
         elif current_user["role"] == "patient":
-             query = db.collection("waitlists").where("patient_id", "==", current_user["uid"])
+             mongo_query = {"patient_id": current_user["uid"]}
         else:
              raise HTTPException(status_code=403, detail="Not authorized")
              
-        docs = query.stream()
+        cursor = db.waitlists.find(mongo_query)
         entries = []
-        for doc in docs:
-             d = doc.to_dict()
-             d["id"] = doc.id
-             entries.append(serialize_doc(d))
+        async for doc in cursor:
+             entries.append(serialize_doc(doc))
              
         # Sort by urgency and date joined
         def sort_key(e):
@@ -60,17 +59,20 @@ def register_waitlist_routes(app, db, get_current_user, log_action, serialize_do
 
     # ── PATCH /api/waitlist/{waitlist_id}/notify ── Notify Patient (Doctor triggers)
     @app.patch("/api/waitlist/{waitlist_id}/notify")
-    def notify_waitlisted_patient(waitlist_id: str, current_user: dict = Depends(get_current_user)):
+    async def notify_waitlisted_patient(waitlist_id: str, current_user: dict = Depends(get_current_user)):
         if current_user["role"] not in ["doctor", "admin", "superadmin"]:
              raise HTTPException(status_code=403, detail="Only doctors/admins can notify patients")
              
-        doc_ref = db.collection("waitlists").document(waitlist_id)
-        if not doc_ref.get().exists:
+        query = {"_id": ObjectId(waitlist_id)} if ObjectId.is_valid(waitlist_id) else {"waitlist_id": waitlist_id}
+        doc = await db.waitlists.find_one(query)
+        if not doc:
              raise HTTPException(status_code=404, detail="Waitlist entry not found")
              
-        doc_ref.update({
-             "status": "notified",
-             "notified_at": firestore.SERVER_TIMESTAMP
+        await db.waitlists.update_one(query, {
+             "$set": {
+                  "status": "notified",
+                  "notified_at": datetime.utcnow()
+             }
         })
         
         # Here we would integrate with NotificationsService (email/sms)
@@ -78,14 +80,14 @@ def register_waitlist_routes(app, db, get_current_user, log_action, serialize_do
 
     # ── DELETE /api/waitlist/{waitlist_id} ── Leave waitlist
     @app.delete("/api/waitlist/{waitlist_id}")
-    def leave_waitlist(waitlist_id: str, current_user: dict = Depends(get_current_user)):
-        doc_ref = db.collection("waitlists").document(waitlist_id)
-        doc = doc_ref.get()
-        if not doc.exists:
+    async def leave_waitlist(waitlist_id: str, current_user: dict = Depends(get_current_user)):
+        query = {"_id": ObjectId(waitlist_id)} if ObjectId.is_valid(waitlist_id) else {"waitlist_id": waitlist_id}
+        doc = await db.waitlists.find_one(query)
+        if not doc:
              raise HTTPException(status_code=404, detail="Entry not found")
              
-        if doc.to_dict().get("patient_id") != current_user["uid"] and current_user["role"] not in ["doctor", "admin", "superuser", "superadmin"]:
+        if doc.get("patient_id") != current_user["uid"] and current_user["role"] not in ["doctor", "admin", "superuser", "superadmin"]:
              raise HTTPException(status_code=403, detail="Not authorized")
              
-        doc_ref.update({"status": "cancelled", "cancelled_at": firestore.SERVER_TIMESTAMP})
+        await db.waitlists.update_one(query, {"$set": {"status": "cancelled", "cancelled_at": datetime.utcnow()}})
         return {"status": "success"}

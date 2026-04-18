@@ -16,8 +16,14 @@ api_key = os.getenv('GEMINI_API_KEY')
 if not api_key:
     raise ValueError("GEMINI_API_KEY is not set in the environment.")
 
-genai.configure(api_key=api_key)
-model = genai.GenerativeModel('gemini-2.5-flash')
+try:
+    genai.configure(api_key=api_key)
+    # Using gemini-1.5-flash for better reliability and performance
+    model = genai.GenerativeModel('gemini-1.5-flash')
+    print("Gemini AI model 'gemini-1.5-flash' initialized.")
+except Exception as e:
+    print(f"CRITICAL: Failed to initialize Gemini model: {e}")
+    model = None
 
 # Mock Dataset for Training
 data = [
@@ -68,39 +74,50 @@ async def predict_appointment(symptoms: str, patient_severity_score: int = 5):
     Fallback to simple mock if Gemini fails.
     """
     prompt = f"""
-    You are an expert triage nurse. Analyze the following patient symptoms: "{symptoms}"
-    The patient has self-reported a pain/severity score of {patient_severity_score} out of 10.
-    Provide your assessment in strict JSON format with exactly these keys:
-    - "department": The specific medical department the patient should visit (e.g., Cardiology, Neurology, General Medicine, Dermatology, Orthopedics, ENT, Psychiatry).
-    - "triage_priority": One of "Low", "Medium", "High", or "Critical".
-    - "estimated_duration_minutes": An integer estimating the typical consultation duration (15 to 60).
-    - "severity_score": An integer from 1 to 10 (you can adjust the patient's self-reported score if needed based on the symptoms).
-    - "summary": A brief, comforting 2-sentence summary of the recommendation.
-    - "immediate_actions": A list of 2 to 4 short, actionable strings the patient should do right now (e.g., ["Drink plenty of water", "Rest in a dark room"]).
-    Return ONLY valid JSON.
+    You are a highly advanced AI triage clinical assistant specializing in initial patient diagnosis and routing.
+    Analyze the following patient symptoms provided in quotes: "{symptoms}"
+    The patient has self-reported a severity of {patient_severity_score}/10.
+
+    Analyze the symptoms with deep clinical logic and provide a structured JSON response.
+    Your response must be based on medical expertise while maintaining a reassuring tone.
+    Provide the response in strict JSON format with exactly these keys:
+    - "department": The most appropriate medical specialty (e.g., Cardiology, Neurology, Orthopedics, Gastroenterology, Dermatology, Psychiatry, Pulmonology, General Medicine).
+    - "triage_priority": "Low", "Medium", "High", or "Critical" based on the severity of symptoms described.
+    - "estimated_duration_minutes": A realistic integer (15, 20, 30, 45, or 60) for a standard consultation in this department.
+    - "severity_score": An adjusted severity score (1-10) based on clinical evaluation of the symptoms vs the patient's self-report.
+    - "confidence_percentage": An integer (0-100) representing your confidence in this routing.
+    - "summary": A professional but comforting 2-sentence summary explaining why this department was chosen.
+    - "immediate_actions": A list of 3-4 specific, actionable, and safe next steps (e.g., "Monitor your temperature every 4 hours", "Apply a cold compress to the swollen area").
+    - "key_concerns": A list of 2-3 specific medical conditions these symptoms could potentially indicate (be professional).
+
+    Return ONLY the valid JSON object.
     """
     try:
+        if model is None:
+            raise ValueError("Gemini model is not initialized")
+
         response = model.generate_content(prompt)
-        # Strip code formatting if any
         text = response.text.strip()
-        if text.startswith('```json'):
-            text = text[7:]
-        if text.endswith('```'):
-            text = text[:-3]
-        text = text.strip()
+        # Robust JSON cleaning
+        if '```json' in text:
+            text = text.split('```json')[1].split('```')[0].strip()
+        elif '```' in text:
+            text = text.split('```')[1].split('```')[0].strip()
         
         data = json.loads(text)
+        
         return {
             "department": data.get("department", "General Medicine"),
-            "estimated_duration_minutes": data.get("estimated_duration_minutes", 30),
+            "estimated_duration_minutes": int(data.get("estimated_duration_minutes", 30)),
             "triage_priority": data.get("triage_priority", "Medium"),
-            "confidence": 0.95,
-            "summary": data.get("summary", f"Based on your symptoms, we recommend visiting {data.get('department')}."),
-            "severity_score": data.get("severity_score", patient_severity_score),
-            "immediate_actions": data.get("immediate_actions", ["Please consult a doctor for further advice."]),
+            "confidence": data.get("confidence_percentage", 90) / 100.0,
+            "summary": data.get("summary", "Complete diagnostic checkup recommended based on symptoms."),
+            "severity_score": int(data.get("severity_score", patient_severity_score)),
+            "immediate_actions": data.get("immediate_actions", ["Rest and observe", "Stay hydrated"]),
+            "key_concerns": data.get("key_concerns", ["General inflammatory response"])
         }
     except Exception as e:
-        print(f"Gemini API Error: {e}")
+        print(f"ML Prediction Error (Gemini): {e}")
         # Fallback to old ML logic
         predicted_dept = dept_model.predict([symptoms])[0]
         confidence = float(max(dept_model.predict_proba([symptoms])[0]))

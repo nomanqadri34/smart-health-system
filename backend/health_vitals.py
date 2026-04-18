@@ -6,7 +6,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel, Field, validator
 from typing import List, Optional, Dict
 from datetime import datetime, timedelta
-from firebase_admin import firestore
+from bson import ObjectId
 import statistics
 
 
@@ -124,28 +124,28 @@ def register_vitals_routes(app, db, get_current_user, log_action, serialize_doc)
 
     # ── POST /api/vitals ── Record a new vital reading
     @app.post("/api/vitals")
-    def record_vital(reading: VitalReading, current_user: dict = Depends(get_current_user)):
+    async def record_vital(reading: VitalReading, current_user: dict = Depends(get_current_user)):
         """Record a new health vital reading for the current patient."""
         try:
             data = reading.dict()
             data["patient_id"] = current_user["uid"]
             data["patient_email"] = current_user.get("email", "")
             data["recorded_at"] = reading.recorded_at or datetime.utcnow().isoformat()
-            data["created_at"] = firestore.SERVER_TIMESTAMP
+            data["created_at"] = datetime.utcnow()
 
             # Compute status
             check_val = reading.systolic if reading.type == "blood_pressure" and reading.systolic else reading.value
             data["status_info"] = check_vital_status(reading.type, check_val)
 
-            ref = db.collection("health_vitals").add(data)
-            log_action(current_user, "record_vital", {"type": reading.type, "value": reading.value})
-            return {"status": "success", "id": ref[1].id, "status_info": data["status_info"]}
+            result = await db.health_vitals.insert_one(data)
+            await log_action(current_user, "record_vital", {"type": reading.type, "value": reading.value})
+            return {"status": "success", "id": str(result.inserted_id), "status_info": data["status_info"]}
         except Exception as e:
             raise HTTPException(status_code=500, detail=str(e))
 
     # ── GET /api/vitals ── Fetch the patient's own vitals
     @app.get("/api/vitals")
-    def get_vitals(
+    async def get_vitals(
         vital_type: Optional[str] = Query(None, description="Filter by vital type"),
         days: int = Query(30, description="Days of history to return"),
         patient_id: Optional[str] = Query(None),
@@ -163,18 +163,15 @@ def register_vitals_routes(app, db, get_current_user, log_action, serialize_doc)
                 uid = current_user["uid"]
 
             cutoff = (datetime.utcnow() - timedelta(days=days)).isoformat()
-            query = db.collection("health_vitals").where("patient_id", "==", uid).where("recorded_at", ">=", cutoff)
+            mongo_query = {"patient_id": uid, "recorded_at": {"$gte": cutoff}}
 
             if vital_type:
-                query = query.where("type", "==", vital_type)
+                mongo_query["type"] = vital_type
 
-            docs = query.stream()
+            cursor = db.health_vitals.find(mongo_query)
             vitals = []
-            for doc in docs:
-                d = doc.to_dict()
-                d["id"] = doc.id
-                d = serialize_doc(d)
-                vitals.append(d)
+            async for doc in cursor:
+                vitals.append(serialize_doc(doc))
 
             vitals.sort(key=lambda x: x.get("recorded_at", ""), reverse=True)
             return {"vitals": vitals, "count": len(vitals)}
@@ -183,7 +180,7 @@ def register_vitals_routes(app, db, get_current_user, log_action, serialize_doc)
 
     # ── GET /api/vitals/summary ── Statistical summary per vital type
     @app.get("/api/vitals/summary")
-    def get_vitals_summary(
+    async def get_vitals_summary(
         days: int = Query(30),
         patient_id: Optional[str] = Query(None),
         current_user: dict = Depends(get_current_user),
@@ -195,13 +192,12 @@ def register_vitals_routes(app, db, get_current_user, log_action, serialize_doc)
             uid = patient_id
 
         cutoff = (datetime.utcnow() - timedelta(days=days)).isoformat()
-        docs = db.collection("health_vitals").where("patient_id", "==", uid).where("recorded_at", ">=", cutoff).stream()
+        cursor = db.health_vitals.find({"patient_id": uid, "recorded_at": {"$gte": cutoff}})
 
         grouped: Dict[str, list] = {}
-        for doc in docs:
-            d = doc.to_dict()
-            t = d.get("type", "unknown")
-            grouped.setdefault(t, []).append(d)
+        async for doc in cursor:
+            t = doc.get("type", "unknown")
+            grouped.setdefault(t, []).append(doc)
 
         summary = {}
         for vtype, readings in grouped.items():
@@ -224,54 +220,51 @@ def register_vitals_routes(app, db, get_current_user, log_action, serialize_doc)
 
     # ── GET /api/vitals/{vital_id} ── Single reading detail
     @app.get("/api/vitals/{vital_id}")
-    def get_single_vital(vital_id: str, current_user: dict = Depends(get_current_user)):
-        doc = db.collection("health_vitals").document(vital_id).get()
-        if not doc.exists:
+    async def get_single_vital(vital_id: str, current_user: dict = Depends(get_current_user)):
+        query = {"_id": ObjectId(vital_id)} if ObjectId.is_valid(vital_id) else {"vital_id": vital_id}
+        doc = await db.health_vitals.find_one(query)
+        if not doc:
             raise HTTPException(status_code=404, detail="Vital reading not found")
-        d = doc.to_dict()
-        d["id"] = doc.id
-        d = serialize_doc(d)
+        d = serialize_doc(doc)
         if current_user["role"] == "patient" and d.get("patient_id") != current_user["uid"]:
             raise HTTPException(status_code=403, detail="Not authorized")
         return d
 
     # ── PATCH /api/vitals/{vital_id} ── Update notes/correction
     @app.patch("/api/vitals/{vital_id}")
-    def update_vital(
+    async def update_vital(
         vital_id: str,
         update: VitalUpdate,
         current_user: dict = Depends(get_current_user),
     ):
-        doc_ref = db.collection("health_vitals").document(vital_id)
-        doc = doc_ref.get()
-        if not doc.exists:
+        query = {"_id": ObjectId(vital_id)} if ObjectId.is_valid(vital_id) else {"vital_id": vital_id}
+        doc = await db.health_vitals.find_one(query)
+        if not doc:
             raise HTTPException(status_code=404, detail="Vital reading not found")
-        d = doc.to_dict()
-        if current_user["role"] == "patient" and d.get("patient_id") != current_user["uid"]:
+        if current_user["role"] == "patient" and doc.get("patient_id") != current_user["uid"]:
             raise HTTPException(status_code=403, detail="Not authorized")
         patch = {k: v for k, v in update.dict().items() if v is not None}
         if patch:
-            doc_ref.update(patch)
-        log_action(current_user, "update_vital", {"id": vital_id})
+            await db.health_vitals.update_one(query, {"$set": patch})
+        await log_action(current_user, "update_vital", {"id": vital_id})
         return {"status": "success", "updated": list(patch.keys())}
 
     # ── DELETE /api/vitals/{vital_id} ── Remove a reading
     @app.delete("/api/vitals/{vital_id}")
-    def delete_vital(vital_id: str, current_user: dict = Depends(get_current_user)):
-        doc_ref = db.collection("health_vitals").document(vital_id)
-        doc = doc_ref.get()
-        if not doc.exists:
+    async def delete_vital(vital_id: str, current_user: dict = Depends(get_current_user)):
+        query = {"_id": ObjectId(vital_id)} if ObjectId.is_valid(vital_id) else {"vital_id": vital_id}
+        doc = await db.health_vitals.find_one(query)
+        if not doc:
             raise HTTPException(status_code=404, detail="Vital reading not found")
-        d = doc.to_dict()
-        if current_user["role"] == "patient" and d.get("patient_id") != current_user["uid"]:
+        if current_user["role"] == "patient" and doc.get("patient_id") != current_user["uid"]:
             raise HTTPException(status_code=403, detail="Not authorized")
-        doc_ref.delete()
-        log_action(current_user, "delete_vital", {"id": vital_id})
+        await db.health_vitals.delete_one(query)
+        await log_action(current_user, "delete_vital", {"id": vital_id})
         return {"status": "success", "message": "Vital reading deleted"}
 
     # ── GET /api/vitals/alerts/active ── Fetch out-of-range alerts
     @app.get("/api/vitals/alerts/active")
-    def get_active_vital_alerts(
+    async def get_active_vital_alerts(
         patient_id: Optional[str] = Query(None),
         current_user: dict = Depends(get_current_user),
     ):
@@ -282,15 +275,13 @@ def register_vitals_routes(app, db, get_current_user, log_action, serialize_doc)
             uid = patient_id
 
         cutoff = (datetime.utcnow() - timedelta(days=7)).isoformat()
-        docs = db.collection("health_vitals").where("patient_id", "==", uid).where("recorded_at", ">=", cutoff).stream()
+        cursor = db.health_vitals.find({"patient_id": uid, "recorded_at": {"$gte": cutoff}})
 
         latest_per_type: Dict[str, dict] = {}
-        for doc in docs:
-            d = doc.to_dict()
-            d["id"] = doc.id
-            t = d.get("type", "")
-            if t not in latest_per_type or d.get("recorded_at", "") > latest_per_type[t].get("recorded_at", ""):
-                latest_per_type[t] = d
+        async for doc in cursor:
+            t = doc.get("type", "")
+            if t not in latest_per_type or doc.get("recorded_at", "") > latest_per_type[t].get("recorded_at", ""):
+                latest_per_type[t] = doc
 
         alerts = []
         for vtype, reading in latest_per_type.items():
@@ -307,14 +298,14 @@ def register_vitals_routes(app, db, get_current_user, log_action, serialize_doc)
                     "recorded_at": reading.get("recorded_at"),
                     "status": status["status"],
                     "message": status["message"],
-                    "reading_id": reading["id"],
+                    "reading_id": str(reading["_id"]),
                 })
         alerts.sort(key=lambda x: x["status"] == "critical", reverse=True)
         return {"alerts": alerts, "count": len(alerts)}
 
     # ── GET /api/vitals/history/export ── CSV-like data export
     @app.get("/api/vitals/history/export")
-    def export_vitals_history(
+    async def export_vitals_history(
         vital_type: Optional[str] = Query(None),
         days: int = Query(90),
         current_user: dict = Depends(get_current_user),
@@ -322,14 +313,14 @@ def register_vitals_routes(app, db, get_current_user, log_action, serialize_doc)
         """Export vitals history in a structured list format for charting."""
         uid = current_user["uid"]
         cutoff = (datetime.utcnow() - timedelta(days=days)).isoformat()
-        query = db.collection("health_vitals").where("patient_id", "==", uid).where("recorded_at", ">=", cutoff)
+        mongo_query = {"patient_id": uid, "recorded_at": {"$gte": cutoff}}
         if vital_type:
-            query = query.where("type", "==", vital_type)
-        docs = query.stream()
+            mongo_query["type"] = vital_type
+            
+        cursor = db.health_vitals.find(mongo_query)
         rows = []
-        for doc in docs:
-            d = doc.to_dict()
-            d = serialize_doc(d)
+        async for doc in cursor:
+            d = serialize_doc(doc)
             rows.append({
                 "date": d.get("recorded_at", ""),
                 "type": d.get("type", ""),

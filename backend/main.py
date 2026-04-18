@@ -8,8 +8,14 @@ import os
 import io
 from fastapi import Depends, HTTPException, status
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
-import firebase_admin
-from firebase_admin import credentials, firestore, auth
+from bson import ObjectId
+from mongodb_engine import get_db
+from google.oauth2 import id_token
+from google.auth.transport import requests as google_requests
+from passlib.context import CryptContext
+from jose import JWTError, jwt
+from fastapi_mail import ConnectionConfig, FastMail, MessageSchema, MessageType
+import razorpay
 
 from ml_logic import predict_appointment, predict_noshow, recommend_doctors, summarize_notes_with_gemini
 
@@ -23,79 +29,146 @@ origins = [
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=origins,
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# --- Firebase Admin Initialization ---
-try:
-    cred = credentials.Certificate('smart-health-51e3f-firebase-adminsdk-fbsvc-8a5938ff60.json')
-    firebase_admin.initialize_app(cred)
-    db = firestore.client()
-    print("Firebase Admin initialized successfully.")
-except Exception as e:
-    print(f"Error initializing Firebase Admin: {e}")
+# --- MongoDB Initialization ---
+db = get_db()
+print("MongoDB initialized successfully.")
 
-# --- Auth Dependency ---
+# --- Auth Setup ---
 security = HTTPBearer()
+pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 
-def get_current_user(credentials: HTTPAuthorizationCredentials = Depends(security)):
+# JWT Config (loaded from .env)
+SECRET_KEY = os.getenv("JWT_SECRET", "super-secret-key-123")
+ALGORITHM = os.getenv("JWT_ALGORITHM", "HS256")
+ACCESS_TOKEN_EXPIRE_MINUTES = int(os.getenv("JWT_EXPIRE_MINUTES", "10080"))
+
+# SMTP Config
+conf = ConnectionConfig(
+    MAIL_USERNAME=os.getenv("MAIL_USERNAME"),
+    MAIL_PASSWORD=os.getenv("MAIL_PASSWORD"),
+    MAIL_FROM=os.getenv("MAIL_FROM"),
+    MAIL_PORT=int(os.getenv("MAIL_PORT", "587")),
+    MAIL_SERVER=os.getenv("MAIL_SERVER", "smtp.gmail.com"),
+    MAIL_FROM_NAME=os.getenv("MAIL_FROM_NAME", "Smart Health"),
+    MAIL_STARTTLS=True,
+    MAIL_SSL_TLS=False,
+    USE_CREDENTIALS=True,
+    VALIDATE_CERTS=True
+)
+
+# Razorpay Config
+RAZORPAY_KEY_ID = os.getenv("RAZORPAY_KEY_ID")
+RAZORPAY_KEY_SECRET = os.getenv("RAZORPAY_KEY_SECRET")
+razorpay_client = razorpay.Client(auth=(RAZORPAY_KEY_ID, RAZORPAY_KEY_SECRET))
+
+def create_access_token(data: dict):
+    to_encode = data.copy()
+    expire = datetime.utcnow() + timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
+    to_encode.update({"exp": expire})
+    encoded_jwt = jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
+    return encoded_jwt
+
+async def get_current_user(credentials: HTTPAuthorizationCredentials = Depends(security)):
     token = credentials.credentials
+    client_id = os.getenv("GOOGLE_CLIENT_ID")
+    
     try:
-        decoded_token = auth.verify_id_token(token)
-        uid = decoded_token.get('uid')
-        
-        user_doc = db.collection('users').document(uid).get()
-        if not user_doc.exists:
-            raise HTTPException(status_code=401, detail="User not found in database")
+        # 1. First try to verify as Google ID Token
+        if client_id and len(token) > 200: 
+            try:
+                idinfo = id_token.verify_oauth2_token(token, google_requests.Request(), client_id)
+                email = idinfo['email']
+                user_data = await db.users.find_one({"email": email})
+            except Exception:
+                user_data = None
+        else:
+            user_data = None
+
+        # 2. If not Google, try as our custom JWT
+        if not user_data:
+            try:
+                payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
+                email = payload.get("sub")
+                if email:
+                    user_data = await db.users.find_one({"email": email})
+            except JWTError:
+                user_data = None
+
+        if not user_data:
+            raise HTTPException(status_code=401, detail="Invalid token or user not found")
             
-        user_data = user_doc.to_dict()
         return {
-            "uid": uid, 
+            "uid": str(user_data.get('uid', user_data.get('_id'))), 
             "role": user_data.get('role', 'patient'), 
-            "email": user_data.get('email') or decoded_token.get('email', ''),
+            "email": user_data.get('email', ''),
             "full_name": user_data.get('full_name', '')
         }
+    except HTTPException:
+        raise
     except Exception as e:
-        print(f"Auth error: {e}")
-        import traceback
-        traceback.print_exc()
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail=f"Auth error: {str(e)}",
-            headers={"WWW-Authenticate": "Bearer"},
-        )
+        raise HTTPException(status_code=401, detail=f"Auth error: {str(e)}")
 
 # --- Audit Log Helper ---
-def log_action(user: dict, action: str, details: dict = {}):
+async def log_action(user: dict, action: str, details: dict = {}):
     try:
-        db.collection('audit_logs').add({
+        await db.audit_logs.insert_one({
             "uid": user.get('uid'),
             "email": user.get('email'),
             "role": user.get('role'),
             "action": action,
             "details": details,
-            "timestamp": firestore.SERVER_TIMESTAMP,
+            "timestamp": datetime.utcnow(),
         })
     except Exception as e:
         print(f"Audit log error: {e}")
 
 def serialize_doc(data: dict) -> dict:
+    if not data:
+        return data
+    if "_id" in data:
+        data["id"] = str(data["_id"])
+        del data["_id"]
     for key, val in data.items():
-        if hasattr(val, 'timestamp'):
+        if isinstance(val, datetime):
+            data[key] = val.isoformat()
+        elif isinstance(val, ObjectId):
             data[key] = str(val)
     return data
 
-@app.get("/")
-def read_root():
-    return {"message": "Smart Health API is running"}
-
 # --- Pydantic Models ---
+
+class SignupRequest(BaseModel):
+    email: EmailStr
+    password: str
+    full_name: str
+    role: str = 'patient'
+
+class VerifySignupOtpRequest(BaseModel):
+    email: EmailStr
+    otp: str
+
+class SigninRequest(BaseModel):
+    email: EmailStr
+    password: str
+
+class ForgotPasswordRequest(BaseModel):
+    email: EmailStr
+
+class ResetPasswordRequest(BaseModel):
+    email: EmailStr
+    token: str # This is the 6-digit OTP
+    new_password: str
 
 class ScheduleRequest(BaseModel):
     appointment_id: str
+    doctor_id: str = ""
+    patient_id: str = ""
     doctor_name: str
     doctor_email: EmailStr
     patient_name: str
@@ -108,6 +181,8 @@ class ScheduleRequest(BaseModel):
     symptoms: str = None
     consultation_fee: float = 0.0
     payment_status: str = "pending"
+    severity_score: int = 0
+    notes: Optional[str] = None
 
 class SymptomInput(BaseModel):
     symptoms: str
@@ -137,6 +212,8 @@ class BulkStatusUpdate(BaseModel):
 
 class PrescriptionCreate(BaseModel):
     appointment_id: str
+    doctor_id: str = ""
+    patient_id: str = ""
     patient_id: str
     patient_name: str
     patient_email: str
@@ -148,18 +225,24 @@ class PrescriptionCreate(BaseModel):
 
 class ConsultationNote(BaseModel):
     appointment_id: str
+    doctor_id: str = ""
+    patient_id: str = ""
     patient_id: str
     patient_name: str
     note: str
 
 class RescheduleRequest(BaseModel):
     appointment_id: str
+    doctor_id: str = ""
+    patient_id: str = ""
     new_date: str
     new_time: str
     reason: str = ""
 
 class ReferralCreate(BaseModel):
     appointment_id: str
+    doctor_id: str = ""
+    patient_id: str = ""
     patient_id: str
     patient_name: str
     patient_email: str
@@ -179,7 +262,7 @@ class ChatCreateMessage(BaseModel):
 
 class MessageContent(BaseModel):
     text: str
-    sender_id: str
+    sender_id: Optional[str] = None
 
 class NoteSummarizeRequest(BaseModel):
     raw_notes: str
@@ -187,6 +270,278 @@ class NoteSummarizeRequest(BaseModel):
 class ReviewCreate(BaseModel):
     rating: int  # 1 to 5
     comment: str = ""
+
+class RazorpayOrderRequest(BaseModel):
+    amount: float # in INR
+    currency: str = "INR"
+
+class RazorpayVerifyRequest(BaseModel):
+    razorpay_order_id: str
+    razorpay_payment_id: str
+    razorpay_signature: str
+
+@app.get("/")
+def read_root():
+    return {"message": "Smart Health API is running"}
+
+class GoogleAuthRequest(BaseModel):
+    credential: str
+    role: Optional[str] = 'patient'
+
+@app.post("/api/auth/google")
+async def google_auth(auth_req: GoogleAuthRequest):
+    client_id = os.getenv("GOOGLE_CLIENT_ID")
+    if not client_id:
+        raise HTTPException(status_code=500, detail="GOOGLE_CLIENT_ID not configured on server")
+    
+    try:
+        idinfo = id_token.verify_oauth2_token(auth_req.credential, google_requests.Request(), client_id)
+        google_uid = idinfo['sub']
+        email = idinfo['email']
+        name = idinfo.get('name', '')
+        picture = idinfo.get('picture', '')
+        
+        # Check if user exists
+        user = await db.users.find_one({"$or": [{"google_uid": google_uid}, {"email": email}, {"uid": google_uid}]})
+        
+        if not user:
+            # Create new user
+            user_obj = {
+                "uid": google_uid,
+                "google_uid": google_uid,
+                "email": email,
+                "full_name": name,
+                "picture": picture,
+                "role": auth_req.role,
+                "created_at": datetime.utcnow()
+            }
+            await db.users.insert_one(user_obj)
+            user = user_obj
+        else:
+            # Update existing user if needed
+            await db.users.update_one({"_id": user["_id"]}, {"$set": {"last_login": datetime.utcnow()}})
+            
+        return serialize_doc(user)
+    except Exception as e:
+        print(f"Login error: {e}")
+        raise HTTPException(status_code=400, detail=str(e))
+
+@app.post("/api/auth/signup")
+async def signup(req: SignupRequest):
+    # 1. Check if user already exists
+    existing_user = await db.users.find_one({"email": req.email})
+    if existing_user:
+        raise HTTPException(status_code=400, detail="User already exists with this email")
+    
+    # 2. Generate OTP and Expiry
+    otp = "".join([str(random.randint(0, 9)) for _ in range(6)])
+    expiry = datetime.utcnow() + timedelta(minutes=10)
+    
+    # 3. Store in pending_registrations
+    hashed_password = pwd_context.hash(req.password)
+    pending_reg = {
+        "email": req.email,
+        "full_name": req.full_name,
+        "hashed_password": hashed_password,
+        "role": req.role,
+        "otp": otp,
+        "expires_at": expiry,
+        "created_at": datetime.utcnow()
+    }
+    
+    await db.pending_registrations.update_one(
+        {"email": req.email},
+        {"$set": pending_reg},
+        upsert=True
+    )
+    
+    # 4. Send Email
+    message = MessageSchema(
+        subject="Smart Health - Verify Your Account",
+        recipients=[req.email],
+        body=f"Welcome! Your verification code for Smart Health is: {otp}. It will expire in 10 minutes.",
+        subtype=MessageType.plain
+    )
+    
+    fm = FastMail(conf)
+    await fm.send_message(message)
+    
+    return {"message": "OTP sent to your email. Please verify to complete registration."}
+
+@app.post("/api/auth/verify-signup-otp")
+async def verify_signup_otp(req: VerifySignupOtpRequest):
+    # 1. Find the pending registration
+    pending = await db.pending_registrations.find_one({
+        "email": req.email,
+        "otp": req.otp,
+        "expires_at": {"$gt": datetime.utcnow()}
+    })
+    
+    if not pending:
+        raise HTTPException(status_code=400, detail="Invalid or expired OTP")
+    
+    # 2. Create the user
+    user_obj = {
+        "email": pending["email"],
+        "full_name": pending["full_name"],
+        "hashed_password": pending["hashed_password"],
+        "role": pending["role"],
+        "verified": True,
+        "created_at": datetime.utcnow()
+    }
+    
+    result = await db.users.insert_one(user_obj)
+    user_obj["_id"] = result.inserted_id
+    
+    # 3. Delete the pending registration
+    await db.pending_registrations.delete_one({"_id": pending["_id"]})
+    
+    # 4. Generate Access Token
+    token = create_access_token(data={"sub": pending["email"]})
+    return {"user": serialize_doc(user_obj), "access_token": token}
+
+@app.post("/api/auth/signin")
+async def signin(req: SigninRequest):
+    user = await db.users.find_one({"email": req.email})
+    if not user or not pwd_context.verify(req.password, user.get("hashed_password", "")):
+        raise HTTPException(status_code=401, detail="Invalid email or password")
+    
+    token = create_access_token(data={"sub": req.email})
+    return {"user": serialize_doc(user), "access_token": token}
+
+@app.post("/api/auth/forgot-password")
+async def forgot_password(req: ForgotPasswordRequest):
+    user = await db.users.find_one({"email": req.email})
+    if not user:
+        # We return success to avoid user enumeration, but don't send email
+        return {"message": "If this email is registered, you will receive a reset code."}
+    
+    # Generate 6-digit code
+    otp = "".join([str(random.randint(0, 9)) for _ in range(6)])
+    expiry = datetime.utcnow() + timedelta(minutes=15)
+    
+    # Store OTP in user record
+    await db.users.update_one({"email": req.email}, {"$set": {"reset_otp": otp, "reset_otp_expiry": expiry}})
+    
+    # Send Email
+    message = MessageSchema(
+        subject="Smart Health Password Reset",
+        recipients=[req.email],
+        body=f"Your password reset code is: {otp}. It will expire in 15 minutes.",
+        subtype=MessageType.plain
+    )
+    
+    fm = FastMail(conf)
+    await fm.send_message(message)
+    
+    return {"message": "Reset code sent to your email."}
+
+@app.post("/api/auth/reset-password")
+async def reset_password(req: ResetPasswordRequest):
+    user = await db.users.find_one({
+        "email": req.email,
+        "reset_otp": req.token,
+        "reset_otp_expiry": {"$gt": datetime.utcnow()}
+    })
+    
+    if not user:
+        raise HTTPException(status_code=400, detail="Invalid or expired reset code")
+    
+    hashed_password = pwd_context.hash(req.new_password)
+    await db.users.update_one(
+        {"email": req.email}, 
+        {
+            "$set": {"hashed_password": hashed_password},
+            "$unset": {"reset_otp": "", "reset_otp_expiry": ""}
+        }
+    )
+    
+    return {"message": "Password updated successfully"}
+
+@app.get("/api/users/profile")
+async def get_user_profile(current_user: dict = Depends(get_current_user)):
+    email = current_user['email']
+    user = await db.users.find_one({"email": email})
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
+    return serialize_doc(user)
+
+@app.patch("/api/users/profile")
+async def update_user_profile(profile_data: dict, current_user: dict = Depends(get_current_user)):
+    uid = current_user['uid']
+    user_query = {"$or": [{"uid": uid}, {"_id": ObjectId(uid)} if ObjectId.is_valid(uid) else {"_id": uid}]}
+    
+    result = await db.users.update_one(user_query, {"$set": profile_data})
+    if result.matched_count == 0:
+        raise HTTPException(status_code=404, detail="User not found")
+        
+    await log_action(current_user, "update_profile", {"fields": list(profile_data.keys())})
+    return {"status": "success"}
+
+# --- Pydantic Models ---
+
+class SignupRequest(BaseModel):
+    email: EmailStr
+    password: str
+    full_name: str
+    role: str = 'patient'
+
+class SigninRequest(BaseModel):
+    email: EmailStr
+    password: str
+
+class ForgotPasswordRequest(BaseModel):
+    email: EmailStr
+
+class ResetPasswordRequest(BaseModel):
+    email: EmailStr
+    token: str # This is the 6-digit OTP
+    new_password: str
+
+class ScheduleRequest(BaseModel):
+    appointment_id: str
+    doctor_id: str = ""
+    patient_id: str = ""
+    doctor_name: str
+    doctor_email: EmailStr
+    patient_name: str
+    patient_email: EmailStr
+    date: str
+    time: str
+    department: str
+    triage_priority: str = None
+    estimated_duration_minutes: int = 30
+    symptoms: str = None
+    consultation_fee: float = 0.0
+    payment_status: str = "pending"
+    severity_score: int = 0
+    notes: Optional[str] = None
+
+class SymptomInput(BaseModel):
+    symptoms: str
+    patient_severity_score: int = 5
+
+class AnalysisResult(BaseModel):
+    department: str
+    confidence: float
+    recommended_doctor: str
+    summary: str
+    immediate_actions: List[str] = []
+
+class RoleUpdate(BaseModel):
+    role: str
+
+class ScheduleSettings(BaseModel):
+    days: List[str]
+    start_time: str
+    end_time: str
+
+class AppointmentUpdate(BaseModel):
+    status: str
+
+class BulkStatusUpdate(BaseModel):
+    appointment_ids: List[str]
+    status: str
 
 # Mock Doctors for ML
 DOCTOR_NAMES = {
@@ -207,26 +562,23 @@ DOCTOR_NAMES = {
 # ===========================================================================
 
 @app.get("/api/users")
-def get_users(current_user: dict = Depends(get_current_user)):
+async def get_users(current_user: dict = Depends(get_current_user)):
     if current_user['role'] not in ['superuser', 'admin', 'superadmin']:
         raise HTTPException(status_code=403, detail="Not authorized")
         
     users = []
-    docs = db.collection('users').stream()
-    for doc in docs:
-        user_data = doc.to_dict()
-        user_data['id'] = doc.id
-        users.append(user_data)
+    cursor = db.users.find()
+    async for doc in cursor:
+        users.append(serialize_doc(doc))
         
     return users
 
 @app.get("/api/doctors")
-def get_doctors():
+async def get_doctors():
     doctors = []
-    docs = db.collection('users').where('role', '==', 'doctor').stream()
-    for doc in docs:
-        user_data = doc.to_dict()
-        user_data['id'] = doc.id
+    cursor = db.users.find({'role': 'doctor'})
+    async for doc in cursor:
+        user_data = serialize_doc(doc)
         if 'password' in user_data:
             del user_data['password']
         doctors.append(user_data)
@@ -234,42 +586,43 @@ def get_doctors():
     return doctors
 
 @app.patch("/api/users/{user_id}/role")
-def update_user_role(user_id: str, role_update: RoleUpdate, current_user: dict = Depends(get_current_user)):
+async def update_user_role(user_id: str, role_update: RoleUpdate, current_user: dict = Depends(get_current_user)):
     if current_user['role'] not in ['superuser', 'admin', 'superadmin']:
         raise HTTPException(status_code=403, detail="Not authorized")
         
     try:
-        db.collection('users').document(user_id).update({"role": role_update.role})
-        log_action(current_user, "update_role", {"target_user": user_id, "new_role": role_update.role})
+        # Check if user_id is an ObjectId or custom UID string
+        query = {"uid": user_id} if not user_id.isalnum() else {"$or": [{"uid": user_id}, {"_id": ObjectId(user_id) if ObjectId.is_valid(user_id) else user_id}]}
+        
+        await db.users.update_one(query, {"$set": {"role": role_update.role}})
+        await log_action(current_user, "update_role", {"target_user": user_id, "new_role": role_update.role})
         return {"status": "success", "message": f"User {user_id} role updated to {role_update.role}"}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.patch("/api/users/{user_id}/schedule")
-def update_user_schedule(user_id: str, settings: ScheduleSettings, current_user: dict = Depends(get_current_user)):
+async def update_user_schedule(user_id: str, settings: ScheduleSettings, current_user: dict = Depends(get_current_user)):
     if current_user['uid'] != user_id and current_user['role'] not in ['superuser', 'admin', 'superadmin']:
         raise HTTPException(status_code=403, detail="Not authorized")
         
     try:
-        db.collection('users').document(user_id).update({"schedule_settings": settings.dict()})
-        log_action(current_user, "update_schedule", {"target_user": user_id})
+        query = {"uid": user_id}
+        await db.users.update_one(query, {"$set": {"schedule_settings": settings.dict()}})
+        await log_action(current_user, "update_schedule", {"target_user": user_id})
         return {"status": "success", "message": "Schedule updated successfully"}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.delete("/api/users/{user_id}")
-def delete_user(user_id: str, current_user: dict = Depends(get_current_user)):
+async def delete_user(user_id: str, current_user: dict = Depends(get_current_user)):
     if current_user['role'] not in ['superuser', 'admin', 'superadmin']:
         raise HTTPException(status_code=403, detail="Not authorized")
         
     try:
-        try:
-            auth.delete_user(user_id)
-        except Exception as auth_error:
-            print(f"Auth deletion skipped: {auth_error}")
-            
-        db.collection('users').document(user_id).delete()
-        log_action(current_user, "delete_user", {"deleted_user": user_id})
+        # Note: Firebase auth deletion commented out or moved to a service if still used
+        # For now, focus on DB
+        await db.users.delete_one({"uid": user_id})
+        await log_action(current_user, "delete_user", {"deleted_user": user_id})
         return {"status": "success", "message": f"User {user_id} deleted"}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
@@ -279,38 +632,38 @@ def delete_user(user_id: str, current_user: dict = Depends(get_current_user)):
 # ===========================================================================
 
 @app.get("/api/appointments")
-def get_appointments(current_user: dict = Depends(get_current_user)):
+async def get_appointments(current_user: dict = Depends(get_current_user)):
     appointments = []
     
+    query = {}
     if current_user['role'] in ['superuser', 'admin', 'superadmin']:
-        docs = db.collection('appointments').stream()
+        query = {}
     elif current_user['role'] == 'doctor':
-        docs = db.collection('appointments').where('doctor_email', '==', current_user['email']).stream()
+        query = {'doctor_email': current_user['email']}
     else:
-        docs = db.collection('appointments').where('patient_email', '==', current_user['email']).stream()
+        query = {'patient_email': current_user['email']}
         
-    for doc in docs:
-        appt_data = doc.to_dict()
-        appt_data['id'] = doc.id
-        appt_data = serialize_doc(appt_data)
-        appointments.append(appt_data)
+    cursor = db.appointments.find(query)
+    async for doc in cursor:
+        appointments.append(serialize_doc(doc))
         
     return appointments
 
 @app.patch("/api/appointments/{appointment_id}/status")
-def update_appointment_status(appointment_id: str, payload: AppointmentUpdate, current_user: dict = Depends(get_current_user)):
+async def update_appointment_status(appointment_id: str, payload: AppointmentUpdate, current_user: dict = Depends(get_current_user)):
     if current_user['role'] not in ['superuser', 'admin', 'superadmin', 'doctor']:
         raise HTTPException(status_code=403, detail="Not authorized")
         
     try:
-        db.collection('appointments').document(appointment_id).update({"status": payload.status})
-        log_action(current_user, "update_appointment_status", {"appointment_id": appointment_id, "new_status": payload.status})
+        query = {"_id": ObjectId(appointment_id)} if ObjectId.is_valid(appointment_id) else {"appointment_id": appointment_id}
+        await db.appointments.update_one(query, {"$set": {"status": payload.status}})
+        await log_action(current_user, "update_appointment_status", {"appointment_id": appointment_id, "new_status": payload.status})
         return {"status": "success", "message": f"Appointment {appointment_id} marked as {payload.status}"}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.post("/api/appointments/bulk-status")
-def bulk_update_appointment_status(payload: BulkStatusUpdate, current_user: dict = Depends(get_current_user)):
+async def bulk_update_appointment_status(payload: BulkStatusUpdate, current_user: dict = Depends(get_current_user)):
     if current_user['role'] not in ['superuser', 'admin', 'superadmin', 'doctor']:
         raise HTTPException(status_code=403, detail="Not authorized")
     
@@ -318,31 +671,32 @@ def bulk_update_appointment_status(payload: BulkStatusUpdate, current_user: dict
     errors = []
     for appt_id in payload.appointment_ids:
         try:
-            db.collection('appointments').document(appt_id).update({"status": payload.status})
+            query = {"_id": ObjectId(appt_id)} if ObjectId.is_valid(appt_id) else {"appointment_id": appt_id}
+            await db.appointments.update_one(query, {"$set": {"status": payload.status}})
             updated += 1
         except Exception as e:
             errors.append(str(e))
     
-    log_action(current_user, "bulk_update_status", {"count": updated, "status": payload.status})
+    await log_action(current_user, "bulk_update_status", {"count": updated, "status": payload.status})
     return {"status": "success", "updated": updated, "errors": errors}
 
 @app.post("/api/appointments/{appointment_id}/reschedule")
-def reschedule_appointment(appointment_id: str, req: RescheduleRequest, current_user: dict = Depends(get_current_user)):
+async def reschedule_appointment(appointment_id: str, req: RescheduleRequest, current_user: dict = Depends(get_current_user)):
     try:
-        appt_ref = db.collection('appointments').document(appointment_id)
-        appt_doc = appt_ref.get()
-        if not appt_doc.exists:
+        query = {"_id": ObjectId(appointment_id)} if ObjectId.is_valid(appointment_id) else {"appointment_id": appointment_id}
+        appt_doc = await db.appointments.find_one(query)
+        if not appt_doc:
             raise HTTPException(status_code=404, detail="Appointment not found")
         
-        appt_ref.update({
+        await db.appointments.update_one(query, {"$set": {
             "reschedule_requested": True,
             "reschedule_new_date": req.new_date,
             "reschedule_new_time": req.new_time,
             "reschedule_reason": req.reason,
             "reschedule_status": "pending",
-            "reschedule_requested_at": firestore.SERVER_TIMESTAMP,
-        })
-        log_action(current_user, "reschedule_request", {"appointment_id": appointment_id, "new_date": req.new_date})
+            "reschedule_requested_at": datetime.utcnow(),
+        }})
+        await log_action(current_user, "reschedule_request", {"appointment_id": appointment_id, "new_date": req.new_date})
         return {"status": "success", "message": "Reschedule request submitted"}
     except HTTPException:
         raise
@@ -350,27 +704,26 @@ def reschedule_appointment(appointment_id: str, req: RescheduleRequest, current_
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.patch("/api/appointments/{appointment_id}/reschedule/approve")
-def approve_reschedule(appointment_id: str, current_user: dict = Depends(get_current_user)):
+async def approve_reschedule(appointment_id: str, current_user: dict = Depends(get_current_user)):
     if current_user['role'] not in ['superuser', 'admin', 'superadmin', 'doctor']:
         raise HTTPException(status_code=403, detail="Not authorized")
     
     try:
-        appt_ref = db.collection('appointments').document(appointment_id)
-        appt_doc = appt_ref.get()
-        if not appt_doc.exists:
+        query = {"_id": ObjectId(appointment_id)} if ObjectId.is_valid(appointment_id) else {"appointment_id": appointment_id}
+        appt_doc = await db.appointments.find_one(query)
+        if not appt_doc:
             raise HTTPException(status_code=404, detail="Appointment not found")
         
-        data = appt_doc.to_dict()
-        new_date = data.get('reschedule_new_date')
-        new_time = data.get('reschedule_new_time')
+        new_date = appt_doc.get('reschedule_new_date')
+        new_time = appt_doc.get('reschedule_new_time')
         
-        appt_ref.update({
+        await db.appointments.update_one(query, {"$set": {
             "date": new_date,
             "time": new_time,
             "reschedule_requested": False,
             "reschedule_status": "approved",
-        })
-        log_action(current_user, "approve_reschedule", {"appointment_id": appointment_id})
+        }})
+        await log_action(current_user, "approve_reschedule", {"appointment_id": appointment_id})
         return {"status": "success", "message": "Reschedule approved"}
     except HTTPException:
         raise
@@ -378,7 +731,7 @@ def approve_reschedule(appointment_id: str, current_user: dict = Depends(get_cur
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.patch("/api/appointments/{appointment_id}/payment")
-def update_appointment_payment(appointment_id: str, payload: PaymentUpdate, current_user: dict = Depends(get_current_user)):
+async def update_appointment_payment(appointment_id: str, payload: PaymentUpdate, current_user: dict = Depends(get_current_user)):
     if current_user['role'] not in ['superuser', 'admin', 'superadmin', 'doctor']:
         raise HTTPException(status_code=403, detail="Not authorized")
     
@@ -386,8 +739,10 @@ def update_appointment_payment(appointment_id: str, payload: PaymentUpdate, curr
         update_data = {"payment_status": payload.payment_status}
         if payload.consultation_fee is not None:
             update_data["consultation_fee"] = payload.consultation_fee
-        db.collection('appointments').document(appointment_id).update(update_data)
-        log_action(current_user, "update_payment", {"appointment_id": appointment_id, "status": payload.payment_status})
+            
+        query = {"_id": ObjectId(appointment_id)} if ObjectId.is_valid(appointment_id) else {"appointment_id": appointment_id}
+        await db.appointments.update_one(query, {"$set": update_data})
+        await log_action(current_user, "update_payment", {"appointment_id": appointment_id, "status": payload.payment_status})
         return {"status": "success"}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
@@ -397,50 +752,48 @@ def update_appointment_payment(appointment_id: str, payload: PaymentUpdate, curr
 # ===========================================================================
 
 @app.post("/api/prescriptions")
-def create_prescription(prescription: PrescriptionCreate, current_user: dict = Depends(get_current_user)):
+async def create_prescription(prescription: PrescriptionCreate, current_user: dict = Depends(get_current_user)):
     if current_user['role'] not in ['doctor', 'superuser', 'admin', 'superadmin']:
         raise HTTPException(status_code=403, detail="Only doctors can issue prescriptions")
     
     try:
         data = prescription.dict()
         data['doctor_id'] = current_user['uid']
-        data['issued_at'] = firestore.SERVER_TIMESTAMP
+        data['issued_at'] = datetime.utcnow()
         data['status'] = 'active'
         
-        ref = db.collection('prescriptions').add(data)
-        log_action(current_user, "issue_prescription", {"patient": prescription.patient_name})
-        return {"status": "success", "prescription_id": ref[1].id}
+        result = await db.prescriptions.insert_one(data)
+        await log_action(current_user, "issue_prescription", {"patient": prescription.patient_name})
+        return {"status": "success", "prescription_id": str(result.inserted_id)}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.get("/api/prescriptions")
-def get_prescriptions(current_user: dict = Depends(get_current_user)):
+async def get_prescriptions(current_user: dict = Depends(get_current_user)):
     prescriptions = []
     
+    query = {}
     if current_user['role'] in ['superuser', 'admin', 'superadmin']:
-        docs = db.collection('prescriptions').stream()
+        query = {}
     elif current_user['role'] == 'doctor':
-        docs = db.collection('prescriptions').where('doctor_id', '==', current_user['uid']).stream()
+        query = {'doctor_id': current_user['uid']}
     else:
-        docs = db.collection('prescriptions').where('patient_email', '==', current_user['email']).stream()
+        query = {'patient_email': current_user['email']}
     
-    for doc in docs:
-        d = doc.to_dict()
-        d['id'] = doc.id
-        d = serialize_doc(d)
-        prescriptions.append(d)
+    cursor = db.prescriptions.find(query)
+    async for doc in cursor:
+        prescriptions.append(serialize_doc(doc))
     
     return prescriptions
 
 @app.get("/api/prescriptions/{prescription_id}")
-def get_prescription(prescription_id: str, current_user: dict = Depends(get_current_user)):
-    doc = db.collection('prescriptions').document(prescription_id).get()
-    if not doc.exists:
+async def get_prescription(prescription_id: str, current_user: dict = Depends(get_current_user)):
+    query = {"_id": ObjectId(prescription_id)} if ObjectId.is_valid(prescription_id) else {"prescription_id": prescription_id}
+    doc = await db.prescriptions.find_one(query)
+    if not doc:
         raise HTTPException(status_code=404, detail="Prescription not found")
     
-    d = doc.to_dict()
-    d['id'] = doc.id
-    d = serialize_doc(d)
+    d = serialize_doc(doc)
     
     # Access control
     if current_user['role'] not in ['superuser', 'admin', 'superadmin']:
@@ -450,36 +803,38 @@ def get_prescription(prescription_id: str, current_user: dict = Depends(get_curr
             raise HTTPException(status_code=403, detail="Not authorized")
     
     return d
+    
+    return d
 
 # ===========================================================================
 # CONSULTATION NOTES
 # ===========================================================================
 
 @app.post("/api/appointments/{appointment_id}/note")
-def save_consultation_note(appointment_id: str, note_data: ConsultationNote, current_user: dict = Depends(get_current_user)):
+async def save_consultation_note(appointment_id: str, note_data: ConsultationNote, current_user: dict = Depends(get_current_user)):
     if current_user['role'] not in ['doctor', 'superuser', 'admin', 'superadmin']:
         raise HTTPException(status_code=403, detail="Only doctors can save notes")
     
     try:
-        ref = db.collection('appointments').document(appointment_id)
-        ref.update({
-            "consultation_note": note_data.note,
-            "note_updated_at": firestore.SERVER_TIMESTAMP
+        query = {"_id": ObjectId(appointment_id)} if ObjectId.is_valid(appointment_id) else {"appointment_id": appointment_id}
+        await db.appointments.update_one(query, {
+            "$set": {
+                "consultation_note": note_data.note,
+                "note_updated_at": datetime.utcnow()
+            }
         })
-        log_action(current_user, "add_note", {"appointment": appointment_id})
+        await log_action(current_user, "add_note", {"appointment": appointment_id})
         return {"status": "success"}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.post("/api/appointments/{appointment_id}/review")
-def add_appointment_review(appointment_id: str, review_data: ReviewCreate, current_user: dict = Depends(get_current_user)):
+async def add_appointment_review(appointment_id: str, review_data: ReviewCreate, current_user: dict = Depends(get_current_user)):
     try:
-        ref = db.collection('appointments').document(appointment_id)
-        apt_doc = ref.get()
-        if not apt_doc.exists:
+        query = {"_id": ObjectId(appointment_id)} if ObjectId.is_valid(appointment_id) else {"appointment_id": appointment_id}
+        apt = await db.appointments.find_one(query)
+        if not apt:
             raise HTTPException(status_code=404, detail="Appointment not found")
-        
-        apt = apt_doc.to_dict()
         
         # Security: only the patient of the appointment can leave a review
         if apt.get('patient_email') != current_user['email'] and current_user['role'] not in ['superuser', 'admin', 'superadmin']:
@@ -494,65 +849,66 @@ def add_appointment_review(appointment_id: str, review_data: ReviewCreate, curre
         review_dict = {
             "rating": review_data.rating,
             "comment": review_data.comment,
-            "created_at": firestore.SERVER_TIMESTAMP
+            "created_at": datetime.utcnow()
         }
         
         # 1. Update the appointment with the review
-        ref.update({"review": review_dict})
+        await db.appointments.update_one(query, {"$set": {"review": review_dict}})
         
         # 2. Update the Doctor's aggregate rating
         doctor_id = apt.get('doctor_id')
         if not doctor_id:
             # Fallback: try to find doctor ID by email if missing
             doctor_email = apt.get('doctor_email')
-            docs = db.collection('users').where('email', '==', doctor_email).limit(1).stream()
-            for d in docs:
-                doctor_id = d.id
-                break
+            doc = await db.users.find_one({'email': doctor_email, 'role': 'doctor'})
+            if doc:
+                doctor_id = str(doc.get('uid', doc.get('_id')))
                 
         if doctor_id:
-            doc_ref = db.collection('users').document(doctor_id)
-            doctor_doc = doc_ref.get()
-            if doctor_doc.exists:
-                doc_data = doctor_doc.to_dict()
-                current_rating = doc_data.get('rating', 0.0)
-                current_count = doc_data.get('total_reviews', 0)
+            doctor_doc = await db.users.find_one({"$or": [{"uid": doctor_id}, {"_id": ObjectId(doctor_id) if ObjectId.is_valid(doctor_id) else doctor_id}]})
+            if doctor_doc:
+                current_rating = doctor_doc.get('rating', 0.0)
+                current_count = doctor_doc.get('total_reviews', 0)
                 
                 # Calculate new average
                 new_count = current_count + 1
-                new_rating = ((current_rating * current_count) + review_data.rating) / new_count
+                new_rating = ((float(current_rating) * current_count) + review_data.rating) / new_count
                 
-                doc_ref.update({
-                    "rating": round(new_rating, 1),
-                    "total_reviews": new_count
+                await db.users.update_one({"_id": doctor_doc["_id"]}, {
+                    "$set": {
+                        "rating": round(new_rating, 1),
+                        "total_reviews": new_count
+                    }
                 })
         
-        log_action(current_user, "add_review", {"appointment": appointment_id, "rating": review_data.rating})
+        await log_action(current_user, "add_review", {"appointment": appointment_id, "rating": review_data.rating})
         return {"status": "success", "message": "Review added successfully"}
+    except HTTPException as he:
+        raise he
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
     except HTTPException as he:
         raise he
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.get("/api/notes")
-def get_notes(patient_id: Optional[str] = Query(None), current_user: dict = Depends(get_current_user)):
+async def get_notes(patient_id: Optional[str] = Query(None), current_user: dict = Depends(get_current_user)):
     notes = []
     
+    query = {}
     if current_user['role'] in ['superuser', 'admin', 'superadmin']:
-        docs = db.collection('consultation_notes').stream()
+        query = {}
     elif current_user['role'] == 'doctor':
+        query = {'doctor_id': current_user['uid']}
         if patient_id:
-            docs = db.collection('consultation_notes').where('doctor_id', '==', current_user['uid']).where('patient_id', '==', patient_id).stream()
-        else:
-            docs = db.collection('consultation_notes').where('doctor_id', '==', current_user['uid']).stream()
+            query['patient_id'] = patient_id
     else:
         raise HTTPException(status_code=403, detail="Not authorized")
     
-    for doc in docs:
-        d = doc.to_dict()
-        d['id'] = doc.id
-        d = serialize_doc(d)
-        notes.append(d)
+    cursor = db.consultation_notes.find(query)
+    async for doc in cursor:
+        notes.append(serialize_doc(doc))
     
     return notes
 
@@ -561,7 +917,7 @@ def get_notes(patient_id: Optional[str] = Query(None), current_user: dict = Depe
 # ===========================================================================
 
 @app.post("/api/referrals")
-def create_referral(referral: ReferralCreate, current_user: dict = Depends(get_current_user)):
+async def create_referral(referral: ReferralCreate, current_user: dict = Depends(get_current_user)):
     if current_user['role'] not in ['doctor', 'superuser', 'admin', 'superadmin']:
         raise HTTPException(status_code=403, detail="Only doctors can create referrals")
     
@@ -570,30 +926,29 @@ def create_referral(referral: ReferralCreate, current_user: dict = Depends(get_c
         data['referring_doctor_id'] = current_user['uid']
         data['referring_doctor_name'] = current_user.get('full_name', current_user['email'])
         data['status'] = 'pending'
-        data['created_at'] = firestore.SERVER_TIMESTAMP
+        data['created_at'] = datetime.utcnow()
         
-        ref = db.collection('referrals').add(data)
-        log_action(current_user, "create_referral", {"patient": referral.patient_name, "to": referral.referred_to_department})
-        return {"status": "success", "referral_id": ref[1].id}
+        result = await db.referrals.insert_one(data)
+        await log_action(current_user, "create_referral", {"patient": referral.patient_name, "to": referral.referred_to_department})
+        return {"status": "success", "referral_id": str(result.inserted_id)}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.get("/api/referrals")
-def get_referrals(current_user: dict = Depends(get_current_user)):
+async def get_referrals(current_user: dict = Depends(get_current_user)):
     referrals = []
     
+    query = {}
     if current_user['role'] in ['superuser', 'admin', 'superadmin']:
-        docs = db.collection('referrals').stream()
+        query = {}
     elif current_user['role'] == 'doctor':
-        docs = db.collection('referrals').where('referring_doctor_id', '==', current_user['uid']).stream()
+        query = {'referring_doctor_id': current_user['uid']}
     else:
-        docs = db.collection('referrals').where('patient_email', '==', current_user['email']).stream()
+        query = {'patient_email': current_user['email']}
     
-    for doc in docs:
-        d = doc.to_dict()
-        d['id'] = doc.id
-        d = serialize_doc(d)
-        referrals.append(d)
+    cursor = db.referrals.find(query)
+    async for doc in cursor:
+        referrals.append(serialize_doc(doc))
     
     return referrals
 
@@ -602,7 +957,7 @@ def get_referrals(current_user: dict = Depends(get_current_user)):
 # ===========================================================================
 
 @app.get("/api/audit-logs")
-def get_audit_logs(
+async def get_audit_logs(
     limit: int = Query(100, le=500),
     current_user: dict = Depends(get_current_user)
 ):
@@ -610,12 +965,9 @@ def get_audit_logs(
         raise HTTPException(status_code=403, detail="Not authorized")
     
     logs = []
-    docs = db.collection('audit_logs').order_by('timestamp', direction=firestore.Query.DESCENDING).limit(limit).stream()
-    for doc in docs:
-        d = doc.to_dict()
-        d['id'] = doc.id
-        d = serialize_doc(d)
-        logs.append(d)
+    cursor = db.audit_logs.find().sort('timestamp', -1).limit(limit)
+    async for doc in cursor:
+        logs.append(serialize_doc(doc))
     
     return logs
 
@@ -624,18 +976,15 @@ def get_audit_logs(
 # ===========================================================================
 
 @app.get("/api/analytics/overview")
-def get_analytics_overview(current_user: dict = Depends(get_current_user)):
+async def get_analytics_overview(current_user: dict = Depends(get_current_user)):
     if current_user['role'] not in ['superuser', 'admin', 'superadmin']:
         raise HTTPException(status_code=403, detail="Not authorized")
     
     # Fetch all appointments
-    docs = list(db.collection('appointments').stream())
+    cursor = db.appointments.find()
     appointments = []
-    for doc in docs:
-        d = doc.to_dict()
-        d['id'] = doc.id
-        d = serialize_doc(d)
-        appointments.append(d)
+    async for doc in cursor:
+        appointments.append(serialize_doc(doc))
     
     # Department utilization
     dept_counts = {}
@@ -682,19 +1031,17 @@ def get_analytics_overview(current_user: dict = Depends(get_current_user)):
     }
 
 @app.get("/api/analytics/revenue")
-def get_revenue_analytics(current_user: dict = Depends(get_current_user)):
+async def get_revenue_analytics(current_user: dict = Depends(get_current_user)):
     if current_user['role'] not in ['superuser', 'admin', 'superadmin']:
         raise HTTPException(status_code=403, detail="Not authorized")
     
-    docs = list(db.collection('appointments').stream())
+    cursor = db.appointments.find()
     appointments = []
     total_revenue = 0.0
     pending_revenue = 0.0
     
-    for doc in docs:
-        d = doc.to_dict()
-        d['id'] = doc.id
-        d = serialize_doc(d)
+    async for doc in cursor:
+        d = serialize_doc(doc)
         fee = float(d.get('consultation_fee', 0) or 0)
         payment_status = d.get('payment_status', 'pending')
         
@@ -713,19 +1060,20 @@ def get_revenue_analytics(current_user: dict = Depends(get_current_user)):
     }
 
 @app.get("/api/analytics/doctor-performance")
-def get_doctor_performance(current_user: dict = Depends(get_current_user)):
+async def get_doctor_performance(current_user: dict = Depends(get_current_user)):
     if current_user['role'] not in ['superuser', 'admin', 'superadmin', 'doctor']:
         raise HTTPException(status_code=403, detail="Not authorized")
     
+    query = {}
     if current_user['role'] == 'doctor':
-        docs = list(db.collection('appointments').where('doctor_email', '==', current_user['email']).stream())
-    else:
-        docs = list(db.collection('appointments').stream())
+        query = {'doctor_email': current_user['email']}
+    
+    cursor = db.appointments.find(query)
     
     # Per-doctor stats
     doctor_stats = {}
-    for doc in docs:
-        d = doc.to_dict()
+    async for doc in cursor:
+        d = serialize_doc(doc)
         email = d.get('doctor_email', 'unknown')
         name = d.get('doctor_name', email)
         if email not in doctor_stats:
@@ -760,31 +1108,29 @@ def get_doctor_performance(current_user: dict = Depends(get_current_user)):
 # ===========================================================================
 
 @app.get("/api/ml/noshow-risk/{appointment_id}")
-def get_noshow_risk(appointment_id: str, current_user: dict = Depends(get_current_user)):
-    doc = db.collection('appointments').document(appointment_id).get()
-    if not doc.exists:
+async def get_noshow_risk(appointment_id: str, current_user: dict = Depends(get_current_user)):
+    query = {"_id": ObjectId(appointment_id)} if ObjectId.is_valid(appointment_id) else {"appointment_id": appointment_id}
+    appt = await db.appointments.find_one(query)
+    if not appt:
         raise HTTPException(status_code=404, detail="Appointment not found")
     
-    appt = doc.to_dict()
-    appt = serialize_doc(appt)
-    risk = predict_noshow(appt)
+    risk = predict_noshow(serialize_doc(appt))
     return risk
 
 @app.get("/api/ml/noshow-risks")
-def get_all_noshow_risks(current_user: dict = Depends(get_current_user)):
+async def get_all_noshow_risks(current_user: dict = Depends(get_current_user)):
     if current_user['role'] not in ['superuser', 'admin', 'superadmin', 'doctor']:
         raise HTTPException(status_code=403, detail="Not authorized")
     
+    query = {'status': 'scheduled'}
     if current_user['role'] == 'doctor':
-        docs = db.collection('appointments').where('doctor_email', '==', current_user['email']).where('status', '==', 'scheduled').stream()
-    else:
-        docs = db.collection('appointments').where('status', '==', 'scheduled').stream()
+        query['doctor_email'] = current_user['email']
+    
+    cursor = db.appointments.find(query)
     
     results = []
-    for doc in docs:
-        appt = doc.to_dict()
-        appt['id'] = doc.id
-        appt = serialize_doc(appt)
+    async for doc in cursor:
+        appt = serialize_doc(doc)
         risk = predict_noshow(appt)
         results.append({**appt, **risk})
     
@@ -797,11 +1143,9 @@ async def ml_recommend_doctors(body: SymptomInput, current_user: dict = Depends(
     dept = prediction['department']
     
     doctors = []
-    docs = db.collection('users').where('role', '==', 'doctor').stream()
-    for doc in docs:
-        d = doc.to_dict()
-        d['id'] = doc.id
-        doctors.append(d)
+    cursor = db.users.find({"role": "doctor"})
+    async for doc in cursor:
+        doctors.append(serialize_doc(doc))
     
     ranked = recommend_doctors(body.symptoms, dept, doctors)
     return {"department": dept, "recommended_doctors": ranked, "prediction": prediction}
@@ -811,54 +1155,147 @@ async def ml_recommend_doctors(body: SymptomInput, current_user: dict = Depends(
 # ===========================================================================
 
 @app.get("/api/chats")
-def get_chats(current_user: dict = Depends(get_current_user)):
+async def get_chats(current_user: dict = Depends(get_current_user)):
     chats = []
-    
-    user_docs = db.collection('chats').where('user_id', '==', current_user['uid']).stream()
-    for doc in user_docs:
-        chat_data = doc.to_dict()
-        chat_data['id'] = doc.id
-        if 'updated_at' in chat_data and chat_data['updated_at']:
-            chat_data['updated_at'] = str(chat_data['updated_at'])
-        chats.append(chat_data)
+    uid = str(current_user['uid'])
+    # Query for chats where the user is either the patient or the doctor
+    # We check both patient_id and doctor_id fields
+    cursor = db.chats.find({"$or": [{"patient_id": uid}, {"doctor_id": uid}, {"user_id": uid}]})
+    async for doc in cursor:
+        chat_data = serialize_doc(doc)
         
-    doc_docs = db.collection('chats').where('doctor_id', '==', current_user['uid']).stream()
-    for doc in doc_docs:
-        chat_data = doc.to_dict()
-        chat_data['id'] = doc.id
-        if 'updated_at' in chat_data and chat_data['updated_at']:
-            chat_data['updated_at'] = str(chat_data['updated_at'])
-        if not any(c['id'] == doc.id for c in chats):
-            chats.append(chat_data)
+        # Check if unlocked for patient
+        if current_user['role'] == 'patient':
+            paid_appt = await db.appointments.find_one({
+                "patient_id": uid,
+                "doctor_id": chat_data.get("doctor_id"),
+                "payment_status": "paid"
+            })
+            chat_data['is_unlocked'] = paid_appt is not None
+        else:
+            # Doctors/Admins always see unlocked
+            chat_data['is_unlocked'] = True
+            
+        chats.append(chat_data)
             
     chats.sort(key=lambda x: x.get('updated_at', ''), reverse=True)
     return chats
 
+class ChatCreateRequest(BaseModel):
+    target_id: str  # The ID of the person to chat with
+    target_name: str
+    target_role: str = 'doctor' # 'doctor' or 'patient'
+
+@app.post("/api/chats")
+async def create_chat(req: ChatCreateRequest, current_user: dict = Depends(get_current_user)):
+    uid = str(current_user['uid'])
+    
+    # Determine roles
+    if req.target_role == 'doctor':
+        doctor_id = req.target_id
+        patient_id = uid
+        doctor_name = req.target_name
+        patient_name = current_user.get('full_name', 'Patient')
+    else:
+        doctor_id = uid
+        patient_id = req.target_id
+        doctor_name = current_user.get('full_name', 'Doctor')
+        patient_name = req.target_name
+
+    # Check if exists
+    existing = await db.chats.find_one({
+        "doctor_id": doctor_id,
+        "patient_id": patient_id
+    })
+    
+    if existing:
+        return serialize_doc(existing)
+        
+    new_chat = {
+        "doctor_id": doctor_id,
+        "patient_id": patient_id,
+        "doctor_name": doctor_name,
+        "patient_name": patient_name,
+        "last_message": "",
+        "updated_at": datetime.utcnow(),
+        "created_at": datetime.utcnow(),
+        "unread_count": 0,
+        "is_encrypted": True # UI flag for requested "professional" feel
+    }
+    
+    result = await db.chats.insert_one(new_chat)
+    new_chat["_id"] = result.inserted_id
+    return serialize_doc(new_chat)
+
 @app.post("/api/chats/{chat_id}/messages")
-def send_message(chat_id: str, msg: MessageContent, current_user: dict = Depends(get_current_user)):
-    chat_doc = db.collection('chats').document(chat_id).get()
-    if not chat_doc.exists:
+async def send_message(chat_id: str, msg: MessageContent, current_user: dict = Depends(get_current_user)):
+    query = {"_id": ObjectId(chat_id)} if ObjectId.is_valid(chat_id) else {"chat_id": chat_id}
+    chat_data = await db.chats.find_one(query)
+    if not chat_data:
         raise HTTPException(status_code=404, detail="Chat not found")
         
-    chat_data = chat_doc.to_dict()
-    if chat_data.get('user_id') != current_user['uid'] and chat_data.get('doctor_id') != current_user['uid'] and current_user['role'] not in ['admin', 'superadmin', 'superuser']:
-        raise HTTPException(status_code=403, detail="Not authorized to send messages in this chat")
+    uid = str(current_user['uid'])
+    chat_patient_id = str(chat_data.get('patient_id', chat_data.get('user_id', '')))
+    chat_doctor_id = str(chat_data.get('doctor_id', ''))
+    
+    if uid not in [chat_patient_id, chat_doctor_id] and current_user['role'] not in ['admin', 'superadmin']:
+        raise HTTPException(status_code=403, detail="Not authorized for this secure channel")
 
+    # Payment Restriction: Patients must have at least one PAID appointment with the doctor
+    if current_user['role'] == 'patient':
+        # Admin/Superuser can bypass for support
+        paid_appt = await db.appointments.find_one({
+            "patient_id": uid,
+            "doctor_id": chat_doctor_id,
+            "payment_status": "paid"
+        })
+        if not paid_appt:
+            raise HTTPException(
+                status_code=402, 
+                detail="Consultation fee payment required to unlock messaging with this doctor."
+            )
+
+    now = datetime.utcnow()
     new_message = {
-        "text": msg.text,
-        "sender_id": current_user['uid'],
-        "timestamp": firestore.SERVER_TIMESTAMP
+        "chat_id": chat_id,
+        "content": msg.text,
+        "sender_id": uid,
+        "created_at": now
     }
     
     try:
-        db.collection('chats').document(chat_id).collection('messages').add(new_message)
-        db.collection('chats').document(chat_id).update({
-            "last_message": msg.text,
-            "updated_at": firestore.SERVER_TIMESTAMP
+        await db.messages.insert_one(new_message)
+        await db.chats.update_one(query, {
+            "$set": {
+                "last_message": msg.text,
+                "updated_at": now
+            }
         })
         return {"status": "success"}
     except Exception as e:
+        print(f"Send message error: {e}")
         raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/api/chats/{chat_id}/messages")
+async def get_chat_messages(chat_id: str, current_user: dict = Depends(get_current_user)):
+    query = {"_id": ObjectId(chat_id)} if ObjectId.is_valid(chat_id) else {"chat_id": chat_id}
+    chat_data = await db.chats.find_one(query)
+    if not chat_data:
+        raise HTTPException(status_code=404, detail="Chat not found")
+        
+    uid = str(current_user['uid'])
+    chat_patient_id = str(chat_data.get('patient_id', chat_data.get('user_id', '')))
+    chat_doctor_id = str(chat_data.get('doctor_id', ''))
+    
+    if uid not in [chat_patient_id, chat_doctor_id] and current_user['role'] not in ['admin', 'superadmin']:
+        raise HTTPException(status_code=403, detail="Not authorized to view this secure channel")
+        
+    messages = []
+    cursor = db.messages.find({"chat_id": chat_id}).sort("created_at", 1)
+    async for doc in cursor:
+        messages.append(serialize_doc(doc))
+        
+    return messages
 
 # ===========================================================================
 # ML SYMPTOM ANALYSIS
@@ -866,11 +1303,17 @@ def send_message(chat_id: str, msg: MessageContent, current_user: dict = Depends
 
 @app.post("/analyze-symptoms", response_model=AnalysisResult)
 async def analyze_symptoms(input_data: SymptomInput):
-    prediction = await predict_appointment(input_data.symptoms, input_data.patient_severity_score)
-    dept = prediction["department"]
-    doctors = DOCTOR_NAMES.get(dept, ["Dr. General"])
-    prediction["recommended_doctor"] = random.choice(doctors)
-    return prediction
+    try:
+        prediction = await predict_appointment(input_data.symptoms, input_data.patient_severity_score)
+        dept = prediction["department"]
+        doctors = DOCTOR_NAMES.get(dept, ["Dr. General"])
+        prediction["recommended_doctor"] = random.choice(doctors)
+        return prediction
+    except Exception as e:
+        print(f"Error in /analyze-symptoms: {e}")
+        import traceback
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=f"Symptom analysis failed: {str(e)}")
 
 # ===========================================================================
 # GEMINI AI ENDPOINTS
@@ -897,8 +1340,10 @@ async def schedule_appointment(
         "appointment_id": req.appointment_id,
         "doctor_name": req.doctor_name,
         "doctor_email": req.doctor_email,
+        "doctor_id": req.doctor_id,
         "patient_name": req.patient_name,
         "patient_email": req.patient_email,
+        "patient_id": req.patient_id,
         "date": req.date,
         "time": req.time,
         "department": req.department,
@@ -908,21 +1353,69 @@ async def schedule_appointment(
         "symptoms": req.symptoms,
         "consultation_fee": req.consultation_fee,
         "payment_status": req.payment_status,
-        "created_at": firestore.SERVER_TIMESTAMP
+        "severity_score": req.severity_score,
+        "notes": req.notes,
+        "created_at": datetime.utcnow()
     }
     
     try:
-        doc_ref = db.collection('appointments').document(req.appointment_id)
-        doc_ref.set(appointment_data)
-        log_action(current_user, "schedule_appointment", {
+        # Use appointment_id as _id or as a field
+        await db.appointments.update_one(
+            {"appointment_id": req.appointment_id}, 
+            {"$set": appointment_data}, 
+            upsert=True
+        )
+        await log_action(current_user, "schedule_appointment", {
             "appointment_id": req.appointment_id,
             "patient": req.patient_name,
             "doctor": req.doctor_name
         })
         return {"status": "Scheduled successfully", "appointment_id": req.appointment_id}
     except Exception as e:
-        print(f"Firestore Error: {e}")
+        print(f"MongoDB Error: {e}")
         raise HTTPException(status_code=500, detail="Failed to save appointment to database")
+
+# ===========================================================================
+# RAZORPAY PAYMENT GATEWAY
+# ===========================================================================
+
+@app.post("/api/razorpay/create-order")
+async def create_razorpay_order(req: RazorpayOrderRequest, current_user: dict = Depends(get_current_user)):
+    try:
+        # Amount must be in paise (ps)
+        amount_paise = int(req.amount * 100)
+        
+        data = {
+            "amount": amount_paise,
+            "currency": req.currency,
+            "receipt": f"receipt_{random.randint(1000, 9999)}",
+            "payment_capture": 1 # Auto capture
+        }
+        
+        order = razorpay_client.order.create(data=data)
+        return order
+    except Exception as e:
+        print(f"Razorpay Order Error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/api/razorpay/verify-payment")
+async def verify_razorpay_payment(req: RazorpayVerifyRequest, current_user: dict = Depends(get_current_user)):
+    try:
+        # Verify signature
+        params_dict = {
+            'razorpay_order_id': req.razorpay_order_id,
+            'razorpay_payment_id': req.razorpay_payment_id,
+            'razorpay_signature': req.razorpay_signature
+        }
+        
+        razorpay_client.utility.verify_payment_signature(params_dict)
+        
+        # Payment is authentic
+        await log_action(current_user, "payment_verified", {"payment_id": req.razorpay_payment_id})
+        return {"status": "success", "message": "Payment verified successfully"}
+    except Exception as e:
+        print(f"Razorpay Verification Error: {e}")
+        raise HTTPException(status_code=400, detail="Payment verification failed")
 
 # Import notification and cache services
 from notification_service import NotificationService

@@ -7,7 +7,7 @@ from pydantic import BaseModel
 from typing import List, Dict, Optional
 from datetime import datetime, timedelta
 import numpy as np
-from firebase_admin import firestore
+from bson import ObjectId
 import statistics
 
 # ─────────────────────────────────────────────────────
@@ -165,7 +165,7 @@ def register_health_analytics_routes(app, db, get_current_user, log_action, seri
 
     # ── GET /api/analytics/health-score ── Personalized Health Score
     @app.get("/api/analytics/health-score")
-    def get_health_score(patient_id: Optional[str] = Query(None), current_user: dict = Depends(get_current_user)):
+    async def get_health_score(patient_id: Optional[str] = Query(None), current_user: dict = Depends(get_current_user)):
         target_id = current_user["uid"]
         if patient_id and current_user["role"] in ["doctor", "superuser", "admin", "superadmin"]:
              target_id = patient_id
@@ -174,22 +174,29 @@ def register_health_analytics_routes(app, db, get_current_user, log_action, seri
         cutoff = (datetime.utcnow() - timedelta(days=30)).isoformat()
         
         # Vitals
-        v_docs = db.collection("health_vitals").where("patient_id", "==", target_id).where("recorded_at", ">=", cutoff).stream()
-        vitals = [doc.to_dict() for doc in v_docs]
+        v_cursor = db.health_vitals.find({"patient_id": target_id, "recorded_at": {"$gte": cutoff}})
+        vitals = []
+        async for doc in v_cursor:
+             vitals.append(doc)
         
         # Adherences
-        m_docs = db.collection("medication_adherence").where("patient_id", "==", target_id).where("logged_at", ">=", cutoff).stream()
-        adherences = [doc.to_dict() for doc in m_docs]
+        m_cursor = db.medication_adherence.find({"patient_id": target_id, "logged_at": {"$gte": cutoff}})
+        adherences = []
+        async for doc in m_cursor:
+             adherences.append(doc)
         
         # Goals
-        g_docs = db.collection("health_goals").where("patient_id", "==", target_id).stream()
-        goals = [doc.to_dict() for doc in g_docs]
+        g_cursor = db.health_goals.find({"patient_id": target_id})
+        goals = []
+        async for doc in g_cursor:
+             goals.append(doc)
 
         # Profile for Age (mock 35 if not found)
         age = 35
-        u_doc = db.collection("users").document(target_id).get()
-        if u_doc.exists:
-             dobstr = u_doc.to_dict().get("dob")
+        user_query = {"_id": ObjectId(target_id)} if ObjectId.is_valid(target_id) else {"uid": target_id}
+        u_doc = await db.users.find_one(user_query)
+        if u_doc:
+             dobstr = u_doc.get("dob")
              if dobstr:
                   try:
                       dob = datetime.strptime(dobstr, "%Y-%m-%d")
@@ -201,25 +208,33 @@ def register_health_analytics_routes(app, db, get_current_user, log_action, seri
         score_data["patient_id"] = target_id
         
         # Store latest score
-        db.collection("health_scores").document(target_id).set({
-             "score": score_data["score"],
-             "risk_level": score_data["risk_level"],
-             "computed_at": firestore.SERVER_TIMESTAMP
-        })
+        await db.health_scores.update_one(
+            {"_id": target_id},
+            {
+                "$set": {
+                    "score": score_data["score"],
+                    "risk_level": score_data["risk_level"],
+                    "computed_at": datetime.utcnow()
+                }
+            },
+            upsert=True
+        )
         
         return score_data
 
     # ── GET /api/analytics/forecast ── Vitals trend forecasting
     @app.get("/api/analytics/forecast")
-    def forecast_patient_vitals(vital_type: str, patient_id: Optional[str] = Query(None), current_user: dict = Depends(get_current_user)):
+    async def forecast_patient_vitals(vital_type: str, patient_id: Optional[str] = Query(None), current_user: dict = Depends(get_current_user)):
         target_id = current_user["uid"]
         if patient_id and current_user["role"] in ["doctor", "superuser", "admin", "superadmin"]:
              target_id = patient_id
              
         # Fetch last 3 months data for better trend
         cutoff = (datetime.utcnow() - timedelta(days=90)).isoformat()
-        v_docs = db.collection("health_vitals").where("patient_id", "==", target_id).where("type", "==", vital_type).where("recorded_at", ">=", cutoff).stream()
-        vitals = [doc.to_dict() for doc in v_docs]
+        cursor = db.health_vitals.find({"patient_id": target_id, "type": vital_type, "recorded_at": {"$gte": cutoff}})
+        vitals = []
+        async for doc in cursor:
+             vitals.append(doc)
         
         forecast = forecast_vital(vitals, vital_type)
         forecast["vital_type"] = vital_type

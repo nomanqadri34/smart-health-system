@@ -6,7 +6,7 @@ from fastapi import Depends, HTTPException, Query
 from pydantic import BaseModel, validator
 from typing import List, Optional, Dict
 from datetime import datetime, timedelta
-from firebase_admin import firestore
+from bson import ObjectId
 
 
 # ─────────────────────────────────────────────────────
@@ -117,7 +117,7 @@ def register_lab_report_routes(app, db, get_current_user, log_action, serialize_
 
     # ── POST /api/lab-reports ── Upload/create a lab report record
     @app.post("/api/lab-reports")
-    def create_lab_report(report: LabReportCreate, current_user: dict = Depends(get_current_user)):
+    async def create_lab_report(report: LabReportCreate, current_user: dict = Depends(get_current_user)):
         """Create a new lab report record."""
         if current_user["role"] not in ["doctor", "superuser", "admin", "superadmin"]:
             raise HTTPException(status_code=403, detail="Only doctors or admins can upload lab reports")
@@ -125,26 +125,26 @@ def register_lab_report_routes(app, db, get_current_user, log_action, serialize_
             data = report.dict()
             data["doctor_id"] = current_user["uid"]
             data["doctor_email"] = current_user.get("email", "")
-            data["uploaded_at"] = firestore.SERVER_TIMESTAMP
+            data["uploaded_at"] = datetime.utcnow()
             data["urgency"] = categorize_urgency(report.interpretation)
             data["abnormal_flags"] = flag_abnormal_results(report.results, report.reference_ranges)
             data["common_ranges"] = {
                 k: v for k, v in COMMON_LAB_RANGES.items()
                 if any(k.lower() in param.lower() for param in report.results.keys())
             }
-            ref = db.collection("lab_reports").add(data)
-            log_action(current_user, "upload_lab_report", {
+            result = await db.lab_reports.insert_one(data)
+            await log_action(current_user, "upload_lab_report", {
                 "patient": report.patient_name,
                 "test": report.test_name,
-                "id": ref[1].id,
+                "id": str(result.inserted_id),
             })
-            return {"status": "success", "report_id": ref[1].id, "urgency": data["urgency"]}
+            return {"status": "success", "report_id": str(result.inserted_id), "urgency": data["urgency"]}
         except Exception as e:
             raise HTTPException(status_code=500, detail=str(e))
 
     # ── GET /api/lab-reports ── Fetch reports (role-aware)
     @app.get("/api/lab-reports")
-    def get_lab_reports(
+    async def get_lab_reports(
         patient_id: Optional[str] = Query(None),
         category: Optional[str] = Query(None),
         interpretation: Optional[str] = Query(None),
@@ -154,43 +154,40 @@ def register_lab_report_routes(app, db, get_current_user, log_action, serialize_
         """Retrieve lab reports; filtered by role."""
         role = current_user["role"]
         cutoff = (datetime.utcnow() - timedelta(days=days)).isoformat()
-
+        
+        mongo_query = {}
         if role in ["superuser", "admin", "superadmin"]:
-            query = db.collection("lab_reports")
             if patient_id:
-                query = query.where("patient_id", "==", patient_id)
+                mongo_query["patient_id"] = patient_id
         elif role == "doctor":
             if patient_id:
-                query = db.collection("lab_reports").where("patient_id", "==", patient_id)
+                mongo_query["patient_id"] = patient_id
             else:
-                query = db.collection("lab_reports").where("doctor_id", "==", current_user["uid"])
+                mongo_query["doctor_id"] = current_user["uid"]
         else:
-            query = db.collection("lab_reports").where("patient_email", "==", current_user.get("email", ""))
+            mongo_query["patient_email"] = current_user.get("email", "")
 
         if category:
-            query = query.where("test_category", "==", category)
+            mongo_query["test_category"] = category
         if interpretation:
-            query = query.where("interpretation", "==", interpretation)
+            mongo_query["interpretation"] = interpretation
 
         reports = []
-        for doc in query.stream():
-            d = doc.to_dict()
-            d["id"] = doc.id
-            d = serialize_doc(d)
-            reports.append(d)
+        cursor = db.lab_reports.find(mongo_query)
+        async for doc in cursor:
+            reports.append(serialize_doc(doc))
 
         reports.sort(key=lambda x: x.get("performed_date", ""), reverse=True)
         return {"reports": reports, "count": len(reports)}
 
     # ── GET /api/lab-reports/{report_id} ── Single report detail
     @app.get("/api/lab-reports/{report_id}")
-    def get_single_lab_report(report_id: str, current_user: dict = Depends(get_current_user)):
-        doc = db.collection("lab_reports").document(report_id).get()
-        if not doc.exists:
+    async def get_single_lab_report(report_id: str, current_user: dict = Depends(get_current_user)):
+        query = {"_id": ObjectId(report_id)} if ObjectId.is_valid(report_id) else {"report_id": report_id}
+        doc = await db.lab_reports.find_one(query)
+        if not doc:
             raise HTTPException(status_code=404, detail="Lab report not found")
-        d = doc.to_dict()
-        d["id"] = doc.id
-        d = serialize_doc(d)
+        d = serialize_doc(doc)
         role = current_user["role"]
         if role == "patient" and d.get("patient_email") != current_user.get("email"):
             raise HTTPException(status_code=403, detail="Not authorized")
@@ -200,51 +197,52 @@ def register_lab_report_routes(app, db, get_current_user, log_action, serialize_
 
     # ── PATCH /api/lab-reports/{report_id} ── Doctor updates remarks/interpretation
     @app.patch("/api/lab-reports/{report_id}")
-    def update_lab_report(
+    async def update_lab_report(
         report_id: str,
         update: LabReportUpdate,
         current_user: dict = Depends(get_current_user),
     ):
         if current_user["role"] not in ["doctor", "superuser", "admin", "superadmin"]:
             raise HTTPException(status_code=403, detail="Only doctors can update lab reports")
-        doc_ref = db.collection("lab_reports").document(report_id)
-        doc = doc_ref.get()
-        if not doc.exists:
+        query = {"_id": ObjectId(report_id)} if ObjectId.is_valid(report_id) else {"report_id": report_id}
+        doc = await db.lab_reports.find_one(query)
+        if not doc:
             raise HTTPException(status_code=404, detail="Lab report not found")
         patch = {k: v for k, v in update.dict().items() if v is not None}
         if "interpretation" in patch:
             patch["urgency"] = categorize_urgency(patch["interpretation"])
-        patch["last_updated"] = firestore.SERVER_TIMESTAMP
-        doc_ref.update(patch)
-        log_action(current_user, "update_lab_report", {"id": report_id})
+        patch["last_updated"] = datetime.utcnow()
+        await db.lab_reports.update_one(query, {"$set": patch})
+        await log_action(current_user, "update_lab_report", {"id": report_id})
         return {"status": "success", "updated": list(patch.keys())}
 
     # ── DELETE /api/lab-reports/{report_id} ── Remove a report
     @app.delete("/api/lab-reports/{report_id}")
-    def delete_lab_report(report_id: str, current_user: dict = Depends(get_current_user)):
+    async def delete_lab_report(report_id: str, current_user: dict = Depends(get_current_user)):
         if current_user["role"] not in ["doctor", "superuser", "admin", "superadmin"]:
             raise HTTPException(status_code=403, detail="Only doctors or admins can delete reports")
-        doc_ref = db.collection("lab_reports").document(report_id)
-        if not doc_ref.get().exists:
+        query = {"_id": ObjectId(report_id)} if ObjectId.is_valid(report_id) else {"report_id": report_id}
+        doc = await db.lab_reports.find_one(query)
+        if not doc:
             raise HTTPException(status_code=404, detail="Lab report not found")
-        doc_ref.delete()
-        log_action(current_user, "delete_lab_report", {"id": report_id})
+        await db.lab_reports.delete_one(query)
+        await log_action(current_user, "delete_lab_report", {"id": report_id})
         return {"status": "success"}
 
     # ── POST /api/lab-reports/{report_id}/share ── Share with doctor
     @app.post("/api/lab-reports/{report_id}/share")
-    def share_lab_report(
+    async def share_lab_report(
         report_id: str,
         share_data: LabReportShare,
         current_user: dict = Depends(get_current_user),
     ):
         """Allow a patient to share their lab report with a doctor."""
-        doc_ref = db.collection("lab_reports").document(report_id)
-        doc = doc_ref.get()
-        if not doc.exists:
+        query = {"_id": ObjectId(report_id)} if ObjectId.is_valid(report_id) else {"report_id": report_id}
+        doc = await db.lab_reports.find_one(query)
+        if not doc:
             raise HTTPException(status_code=404, detail="Lab report not found")
-        d = doc.to_dict()
-        if d.get("patient_email") != current_user.get("email") and current_user["role"] not in ["superuser", "admin", "superadmin"]:
+
+        if doc.get("patient_email") != current_user.get("email") and current_user["role"] not in ["superuser", "admin", "superadmin"]:
             raise HTTPException(status_code=403, detail="Can only share your own reports")
 
         share_record = {
@@ -253,34 +251,36 @@ def register_lab_report_routes(app, db, get_current_user, log_action, serialize_
             "shared_with_doctor_id": share_data.share_with_doctor_id,
             "message": share_data.message,
             "expires_at": (datetime.utcnow() + timedelta(days=share_data.expires_in_days)).isoformat(),
-            "shared_at": firestore.SERVER_TIMESTAMP,
+            "shared_at": datetime.utcnow(),
             "active": True,
         }
-        ref = db.collection("lab_report_shares").add(share_record)
-        log_action(current_user, "share_lab_report", {"report_id": report_id, "to": share_data.share_with_doctor_id})
-        return {"status": "success", "share_id": ref[1].id}
+        result = await db.lab_report_shares.insert_one(share_record)
+        await log_action(current_user, "share_lab_report", {"report_id": report_id, "to": share_data.share_with_doctor_id})
+        return {"status": "success", "share_id": str(result.inserted_id)}
 
     # ── GET /api/lab-reports/stats/summary ── Aggregated lab stats for patient
     @app.get("/api/lab-reports/stats/summary")
-    def get_lab_stats_summary(
+    async def get_lab_stats_summary(
         patient_id: Optional[str] = Query(None),
         current_user: dict = Depends(get_current_user),
     ):
         """Return a count breakdown of lab reports by category and interpretation."""
         role = current_user["role"]
+        
+        mongo_query = {}
         if role in ["superuser", "admin", "superadmin", "doctor"] and patient_id:
-            query = db.collection("lab_reports").where("patient_id", "==", patient_id)
+            mongo_query["patient_id"] = patient_id
         else:
-            query = db.collection("lab_reports").where("patient_email", "==", current_user.get("email", ""))
+            mongo_query["patient_email"] = current_user.get("email", "")
 
         categories = {}
         interpretations = {}
         critical_count = 0
 
-        for doc in query.stream():
-            d = doc.to_dict()
-            cat = d.get("test_category", "Other")
-            interp = d.get("interpretation", "Pending")
+        cursor = db.lab_reports.find(mongo_query)
+        async for doc in cursor:
+            cat = doc.get("test_category", "Other")
+            interp = doc.get("interpretation", "Pending")
             categories[cat] = categories.get(cat, 0) + 1
             interpretations[interp] = interpretations.get(interp, 0) + 1
             if interp == "Critical":

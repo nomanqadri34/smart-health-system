@@ -6,7 +6,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel, validator
 from typing import List, Optional, Dict
 from datetime import datetime, timedelta
-from firebase_admin import firestore
+from bson import ObjectId
 
 # ─────────────────────────────────────────────────────
 # Pydantic Models
@@ -42,42 +42,39 @@ def register_health_goals_routes(app, db, get_current_user, log_action, serializ
 
     # ── POST /api/goals ── Create a goal
     @app.post("/api/goals")
-    def create_goal(goal: HealthGoal, current_user: dict = Depends(get_current_user)):
+    async def create_goal(goal: HealthGoal, current_user: dict = Depends(get_current_user)):
         data = goal.dict()
         data["patient_id"] = current_user["uid"]
         data["status"] = "in_progress" # in_progress, achieved, failed
-        data["created_at"] = firestore.SERVER_TIMESTAMP
+        data["created_at"] = datetime.utcnow()
         data["progress_logs"] = [] # Timeline of updates
         
-        ref = db.collection("health_goals").add(data)
-        log_action(current_user, "create_goal", {"title": goal.title})
-        return {"status": "success", "id": ref[1].id}
+        result = await db.health_goals.insert_one(data)
+        await log_action(current_user, "create_goal", {"title": goal.title})
+        return {"status": "success", "id": str(result.inserted_id)}
 
     # ── GET /api/goals ── Fetch goals
     @app.get("/api/goals")
-    def get_goals(status: Optional[str] = Query(None), current_user: dict = Depends(get_current_user)):
-        query = db.collection("health_goals").where("patient_id", "==", current_user["uid"])
+    async def get_goals(status: Optional[str] = Query(None), current_user: dict = Depends(get_current_user)):
+        mongo_query = {"patient_id": current_user["uid"]}
         if status:
-            query = query.where("status", "==", status)
+            mongo_query["status"] = status
             
-        docs = query.stream()
+        cursor = db.health_goals.find(mongo_query)
         goals = []
-        for doc in docs:
-            d = doc.to_dict()
-            d["id"] = doc.id
-            goals.append(serialize_doc(d))
+        async for doc in cursor:
+            goals.append(serialize_doc(doc))
             
         return goals
 
     # ── POST /api/goals/{goal_id}/progress ── Update progress
     @app.post("/api/goals/{goal_id}/progress")
-    def update_goal_progress(goal_id: str, update: GoalProgressUpdate, current_user: dict = Depends(get_current_user)):
-        doc_ref = db.collection("health_goals").document(goal_id)
-        doc = doc_ref.get()
-        if not doc.exists:
+    async def update_goal_progress(goal_id: str, update: GoalProgressUpdate, current_user: dict = Depends(get_current_user)):
+        query = {"_id": ObjectId(goal_id)} if ObjectId.is_valid(goal_id) else {"goal_id": goal_id}
+        goal_data = await db.health_goals.find_one(query)
+        if not goal_data:
             raise HTTPException(status_code=404, detail="Goal not found")
         
-        goal_data = doc.to_dict()
         if goal_data.get("patient_id") != current_user["uid"]:
             raise HTTPException(status_code=403, detail="Not authorized")
             
@@ -91,46 +88,48 @@ def register_health_goals_routes(app, db, get_current_user, log_action, serializ
         if new_value >= goal_data.get("target_value", 0):
              new_status = "achieved"
              
+        now = datetime.utcnow()
         log_entry = {
-            "timestamp": firestore.SERVER_TIMESTAMP,
+            "timestamp": now,
             "previous_value": goal_data.get("current_value"),
             "new_value": new_value,
             "notes": update.notes or ""
         }
         
-        doc_ref.update({
-            "current_value": new_value,
-            "status": new_status,
-            "updated_at": firestore.SERVER_TIMESTAMP,
-            "progress_logs": firestore.ArrayUnion([log_entry])
+        await db.health_goals.update_one(query, {
+            "$set": {
+                "current_value": new_value,
+                "status": new_status,
+                "updated_at": now
+            },
+            "$push": {"progress_logs": log_entry}
         })
         
         return {"status": "success", "new_value": new_value, "goal_status": new_status}
 
     # ── DELETE /api/goals/{goal_id} ── Delete goal
     @app.delete("/api/goals/{goal_id}")
-    def delete_goal(goal_id: str, current_user: dict = Depends(get_current_user)):
-        doc_ref = db.collection("health_goals").document(goal_id)
-        doc = doc_ref.get()
-        if not doc.exists or doc.to_dict().get("patient_id") != current_user["uid"]:
+    async def delete_goal(goal_id: str, current_user: dict = Depends(get_current_user)):
+        query = {"_id": ObjectId(goal_id)} if ObjectId.is_valid(goal_id) else {"goal_id": goal_id}
+        doc = await db.health_goals.find_one(query)
+        if not doc or doc.get("patient_id") != current_user["uid"]:
             raise HTTPException(status_code=403, detail="Not authorized")
-        doc_ref.delete()
+        await db.health_goals.delete_one(query)
         return {"status": "success"}
 
     # ── GET /api/goals/dashboard ── Dashboard stats
     @app.get("/api/goals/dashboard")
-    def get_goals_dashboard(current_user: dict = Depends(get_current_user)):
-        docs = db.collection("health_goals").where("patient_id", "==", current_user["uid"]).stream()
+    async def get_goals_dashboard(current_user: dict = Depends(get_current_user)):
+        cursor = db.health_goals.find({"patient_id": current_user["uid"]})
         total_goals = 0
         achieved = 0
         categories = {}
         
-        for doc in docs:
-            d = doc.to_dict()
+        async for doc in cursor:
             total_goals += 1
-            if d.get("status") == "achieved":
+            if doc.get("status") == "achieved":
                 achieved += 1
-            cat = d.get("category", "other")
+            cat = doc.get("category", "other")
             categories[cat] = categories.get(cat, 0) + 1
             
         return {
