@@ -18,9 +18,9 @@ if not api_key:
 
 try:
     genai.configure(api_key=api_key)
-    # Using gemini-1.5-flash for better reliability and performance
-    model = genai.GenerativeModel('gemini-1.5-flash')
-    print("Gemini AI model 'gemini-1.5-flash' initialized.")
+    # Using the stable gemini-2.5-flash model
+    model = genai.GenerativeModel('models/gemini-2.5-flash')
+    print("Gemini AI model 'gemini-2.5-flash' initialized.")
 except Exception as e:
     print(f"CRITICAL: Failed to initialize Gemini model: {e}")
     model = None

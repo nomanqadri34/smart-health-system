@@ -1,4 +1,4 @@
-from fastapi import FastAPI, BackgroundTasks, Query
+﻿from fastapi import FastAPI, BackgroundTasks, Query
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, EmailStr
 import random
@@ -194,6 +194,10 @@ class AnalysisResult(BaseModel):
     recommended_doctor: str
     summary: str
     immediate_actions: List[str] = []
+    triage_priority: str = "Medium"
+    severity_score: float = 5.0
+    estimated_duration_minutes: int = 30
+    key_concerns: List[str] = []
 
 class RoleUpdate(BaseModel):
     role: str
@@ -527,6 +531,10 @@ class AnalysisResult(BaseModel):
     recommended_doctor: str
     summary: str
     immediate_actions: List[str] = []
+    triage_priority: str = "Medium"
+    severity_score: float = 5.0
+    estimated_duration_minutes: int = 30
+    key_concerns: List[str] = []
 
 class RoleUpdate(BaseModel):
     role: str
@@ -1326,6 +1334,67 @@ async def ai_summarize_notes(req: NoteSummarizeRequest, current_user: dict = Dep
         
     summary = await summarize_notes_with_gemini(req.raw_notes)
     return {"summary": summary}
+
+class DeepAnalysisRequest(BaseModel):
+    symptoms: str = ""
+    department: str = "General Medicine"
+    triage_priority: str = "Medium"
+    severity_score: Optional[float] = 5.0
+
+@app.post("/api/gemini/deep-analysis")
+async def gemini_deep_analysis(req: DeepAnalysisRequest):
+    """
+    Generates a rich, patient-friendly narrative analysis using Gemini AI.
+    Returns detailed health insights, lifestyle advice, and consultation tips.
+    """
+    from ml_logic import model as gemini_model
+    
+    severity = int(req.severity_score or 5)
+    prompt = f"""
+    You are a compassionate and expert medical AI assistant. A patient has reported the following:
+    - Symptoms: {req.symptoms}
+    - Recommended Department: {req.department}
+    - Triage Priority: {req.triage_priority}
+    - Self-Reported Severity: {severity}/10
+
+    Provide a comprehensive, patient-friendly health analysis report in strict JSON format with EXACTLY these keys:
+    - "narrative": A warm, 3-4 sentence paragraph explaining what these symptoms might suggest in plain language. Do not use medical jargon excessively.
+    - "lifestyle_advice": A list of 3-4 specific lifestyle changes or home care tips directly related to the symptoms.
+    - "warning_signs": A list of 3 specific red-flag symptoms that should prompt the patient to seek emergency care immediately.
+    - "questions_for_doctor": A list of 3-4 smart questions the patient should ask their doctor during the consultation.
+    - "diet_tips": A list of 2-3 dietary recommendations that may help alleviate or not worsen the symptoms.
+    - "mental_health_note": A single encouraging sentence acknowledging the patient's concern and reassuring them.
+
+    Return ONLY the valid JSON object. Be helpful, warm, and clear.
+    """
+    
+    try:
+        if gemini_model is None:
+            raise ValueError("Gemini model not initialized")
+        
+        response = gemini_model.generate_content(prompt)
+        text = response.text.strip()
+        
+        # Clean markdown fences if present
+        if '```json' in text:
+            text = text.split('```json')[1].split('```')[0].strip()
+        elif '```' in text:
+            text = text.split('```')[1].split('```')[0].strip()
+        
+        import json
+        data = json.loads(text)
+        return {
+            "narrative": data.get("narrative", "Our AI has analyzed your symptoms and routed you to the best specialist."),
+            "lifestyle_advice": data.get("lifestyle_advice", ["Rest well", "Stay hydrated", "Monitor symptoms"]),
+            "warning_signs": data.get("warning_signs", ["Severe worsening of symptoms", "High fever", "Difficulty breathing"]),
+            "questions_for_doctor": data.get("questions_for_doctor", ["What is the most likely diagnosis?", "What tests do I need?"]),
+            "diet_tips": data.get("diet_tips", ["Stay hydrated", "Avoid processed foods"]),
+            "mental_health_note": data.get("mental_health_note", "It is great that you are taking care of your health. You are in good hands.")
+        }
+    except Exception as e:
+        print(f"Gemini Deep Analysis Error: {e}")
+        raise HTTPException(status_code=500, detail=f"Gemini analysis failed: {str(e)}")
+
 
 # ===========================================================================
 # APPOINTMENT SCHEDULING
